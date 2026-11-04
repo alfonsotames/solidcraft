@@ -268,3 +268,40 @@ fn a_hole_centred_on_its_face_is_both_the_faces_centre_and_the_holes() {
     let rim = here[1].1.edge.unwrap();
     assert!((rim.dist(at) - 4.0).abs() < 1e-9 && (rim.z - 10.0).abs() < 1e-9, "{rim:?}");
 }
+
+#[test]
+fn a_washers_two_rims_keep_a_centre_each() {
+    // A Ø20 × 5 disc with a Ø8 hole through its middle: its top is a washer.
+    let mut s = Session::default();
+    run(&mut s, "solid.cylinder", json!({"radius": 10, "height": 5, "base": [0, 0, 0]}));
+    run(&mut s, "solid.cylinder", json!({"radius": 4, "height": 7, "base": [0, 0, -1], "operation": "cut"}));
+    let top = face(&s, |p| (p.z - 5.0).abs() < 1e-9);
+    let got = snap_points_from(&s, &top);
+    let at = Vec3::new(0.0, 0.0, 5.0);
+    let mut radii: Vec<f64> = got
+        .iter()
+        .filter(|(p, _)| p.kind == SnapKind::Centre && p.at.dist(at) < 1e-9)
+        .filter_map(|(p, from)| from.edge.map(|e| e.dist(p.at)))
+        .collect();
+    radii.sort_by(f64::total_cmp);
+    assert!(radii.len() == 2 && (radii[0] - 4.0).abs() < 1e-9 && (radii[1] - 10.0).abs() < 1e-9, "one centre per rim: {got:?}");
+}
+
+#[test]
+fn a_washer_far_from_the_origin_keeps_both_its_rims() {
+    // Rims of 4 and 4.05 around (60000, 0, 5): 60 m out, the place's own tolerance is wider than
+    // the 0.05 between them, so the rims are told apart by their radii.
+    let mut s = Session::default();
+    run(&mut s, "solid.cylinder", json!({"radius": 4.05, "height": 5, "base": [60000, 0, 0]}));
+    run(&mut s, "solid.cylinder", json!({"radius": 4, "height": 7, "base": [60000, 0, -1], "operation": "cut"}));
+    let top = face(&s, |p| (p.z - 5.0).abs() < 1e-9);
+    let got = snap_points_from(&s, &top);
+    let at = Vec3::new(60000.0, 0.0, 5.0);
+    let mut radii: Vec<f64> = got
+        .iter()
+        .filter(|(p, _)| p.kind == SnapKind::Centre && p.at.dist(at) < 1e-6)
+        .filter_map(|(p, from)| from.edge.map(|e| e.dist(p.at)))
+        .collect();
+    radii.sort_by(f64::total_cmp);
+    assert!(radii.len() == 2 && (radii[0] - 4.0).abs() < 1e-6 && (radii[1] - 4.05).abs() < 1e-6, "one centre per rim: {radii:?} in {got:?}");
+}
