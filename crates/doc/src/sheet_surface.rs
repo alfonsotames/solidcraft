@@ -345,7 +345,7 @@ fn piece_of(curves: &[(Seg2, Aabb2)], s: &Seg2) -> Option<Seg2> {
 }
 
 /// The part of `g` from parameter `t0` to `t1` (`t0` < `t1`), the same kind of curve.
-fn part(g: &Seg2, t0: f64, t1: f64) -> Seg2 {
+pub(crate) fn part(g: &Seg2, t0: f64, t1: f64) -> Seg2 {
     let right = if t0 > 1e-12 { g.split_at(t0).1 } else { *g };
     let t = (t1 - t0) / (1.0 - t0).max(1e-300);
     if t < 1.0 - 1e-12 { right.split_at(t).0 } else { right }
@@ -354,7 +354,7 @@ fn part(g: &Seg2, t0: f64, t1: f64) -> Seg2 {
 /// `piece` with its ends put exactly on `p` and `q`, where they lie within [`AS_DRAWN`] of them:
 /// the result's corners, which its neighbours start and end on. An arc keeps its centre and
 /// radius, and so its ends as they are.
-fn ending_at(piece: Seg2, p: Vec2, q: Vec2) -> Seg2 {
+pub(crate) fn ending_at(piece: Seg2, p: Vec2, q: Vec2) -> Seg2 {
     match piece {
         Seg2::Cubic { p1, p2, .. } => Seg2::Cubic { p0: p, p1, p2, p3: q },
         Seg2::Conic { apex, w, .. } => Seg2::Conic { a: p, apex, b: q, w },

@@ -2421,7 +2421,10 @@ impl SurfaceSheet {
     /// The sheet with its flat as a flat pattern is read: seen from the sheet's surface, the side
     /// its up bends rise to. The panels' charts face the material, so the flat they lay out is
     /// that view mirrored; here its regions, bends, roll lines, pockets and perforation outlines
-    /// are mirrored back (a base flange's flat is its sketch's outline as drawn).
+    /// are mirrored back (a base flange's flat is its sketch's outline as drawn). A bend row runs
+    /// along the bend with the earlier panel's material on the left of its direction, as the flat
+    /// is read: the anchors keep that material on their left in the chart, and the mirror flips
+    /// handedness, so each bend's centre line is turned round here.
     pub fn shown(&self) -> SurfaceSheet {
         let f = |p: Vec2| Vec2::new(p.x, -p.y);
         let r = |g: &Region2| rigid_region(g, f);
@@ -2429,7 +2432,8 @@ impl SurfaceSheet {
         out.regions = self.regions.iter().map(r).collect();
         for b in &mut out.bends {
             b.zone = r(&b.zone);
-            (b.start, b.end) = (f(b.start), f(b.end));
+            // Turned round with the mirror: the earlier panel's material stays on its left.
+            (b.start, b.end) = (f(b.end), f(b.start));
             b.tabs = b.tabs.iter().map(r).collect();
         }
         for l in &mut out.roll_lines {
