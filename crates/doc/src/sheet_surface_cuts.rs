@@ -78,9 +78,33 @@ struct OnPanel {
     far_floors: Vec<(f64, Region2)>,
 }
 
+/// An extrude as it was drawn: its sketch plane and the interval along the plane's normal it ran
+/// over (see `ModelState::cut_extents`).
+pub(crate) type Drawn = (Plane, (f64, f64));
+
+/// The depth of a floor through the point `floor` from the panel's face through `face`, the panel's
+/// material toward `z`, `measured` in the panel's frame. Where the extrude `drawn` that cut it ran
+/// from that face to the floor (each within `tol` of an end of its interval), the pocket is as
+/// deep as the extrude ran, exactly: a folded panel's frame is where its fold puts it, to a
+/// rounding, and the floor's plane measured in it is that rounding off what was asked for.
+fn drawn_depth(measured: f64, face: Vec3, floor: Vec3, z: Vec3, drawn: Option<&Drawn>, tol: f64) -> f64 {
+    let Some((plane, (a, b))) = drawn else { return measured };
+    let n = plane.normal();
+    if z.cross(n).len() > 1e-9 {
+        return measured;
+    }
+    let at = |p: Vec3| (p - plane.origin).dot(n);
+    let (from, to) = (at(face), at(floor));
+    match [(*a, *b), (*b, *a)].into_iter().find(|(s, e)| (from - s).abs() <= tol && (to - e).abs() <= tol) {
+        Some((s, e)) if ((e - s).abs() - measured).abs() <= tol => (e - s).abs(),
+        _ => measured,
+    }
+}
+
 /// The planar faces of `b` parallel to a panel whose frame is `frame` (its material toward
-/// `z`, `t` deep), within its region `own` (or, unfolded, the whole flat's regions).
-fn on_panel(b: &Body, q: &Query, frame: &Rigid3, t: f64, own: &[Region2], tol: f64) -> Result<OnPanel> {
+/// `z`, `t` deep), within its region `own` (or, unfolded, the whole flat's regions). A floor the
+/// extrude `drawn` made is as deep as it ran (see [`drawn_depth`]).
+fn on_panel(b: &Body, q: &Query, frame: &Rigid3, t: f64, own: &[Region2], tol: f64, drawn: Option<&Drawn>) -> Result<OnPanel> {
     let mut out = OnPanel::default();
     for f in 0..q.record().faces.len() {
         let Some(FaceSurface::Plane { normal, .. }) = face_surface(b, f) else { continue };
@@ -114,9 +138,11 @@ fn on_panel(b: &Body, q: &Query, frame: &Rigid3, t: f64, own: &[Region2], tol: f
         } else if (depth - t).abs() <= tol && toward {
             out.far.extend(mine);
         } else if !toward && depth > tol {
+            let depth = drawn_depth(depth, frame.shift, plane.origin, frame.z, drawn, tol);
             out.near_floors.extend(mine.into_iter().map(|r| (depth, r)));
         } else if toward && depth < t - tol {
-            out.far_floors.extend(mine.into_iter().map(|r| (t - depth, r)));
+            let depth = drawn_depth(t - depth, frame.shift + frame.z * t, plane.origin, frame.z, drawn, tol);
+            out.far_floors.extend(mine.into_iter().map(|r| (depth, r)));
         }
     }
     Ok(out)
@@ -852,7 +878,7 @@ pub(crate) enum Absorbed {
     Refused(String),
 }
 
-pub(crate) fn absorb(before: &ModelState, after: &ModelState, f: &Feature, weigh: bool) -> Result<Vec<(usize, Absorbed)>> {
+pub(crate) fn absorb(before: &ModelState, after: &ModelState, f: &Feature, weigh: bool, drawn: Option<&Drawn>) -> Result<Vec<(usize, Absorbed)>> {
     if f.kind.is_sheet()
         || matches!(
             f.kind,
@@ -883,7 +909,7 @@ pub(crate) fn absorb(before: &ModelState, after: &ModelState, f: &Feature, weigh
         if sk.altered_by.is_some() {
             continue;
         }
-        match cut(&sk, &was, &now, weigh) {
+        match cut(&sk, &was, &now, weigh, drawn) {
             Ok((cut, built)) => out.push((i, Absorbed::Read(Box::new(cut), built))),
             Err(e) => out.push((i, Absorbed::Refused(format!("`{}`: what {} cut {e}", sk.body, f.name)))),
         }
@@ -894,10 +920,17 @@ pub(crate) fn absorb(before: &ModelState, after: &ModelState, f: &Feature, weigh
 /// The sheet `sk` with what was cut from its body, `was` before and `now` after, read onto its
 /// flat panels, and its body built again. Every face the cut made must lie in a panel or a piece
 /// of the flat it was read in. Weighed (`weigh`), the body built again must also weigh what `now`
-/// does: a check of the reading itself, which costs more than the rest of it.
-pub(crate) fn cut(sk: &SurfaceSheet, was: &Body, now: &Body, weigh: bool) -> std::result::Result<(SurfaceSheet, Body), String> {
+/// does: a check of the reading itself, which costs more than the rest of it. The extrude `drawn`
+/// that made the cut, if one did, gives its pockets their depths.
+pub(crate) fn cut(
+    sk: &SurfaceSheet,
+    was: &Body,
+    now: &Body,
+    weigh: bool,
+    drawn: Option<&Drawn>,
+) -> std::result::Result<(SurfaceSheet, Body), String> {
     let walls = made(was, now, tolerance(was));
-    let (mut out, read) = onto_panels(sk, was, now, Some(&walls))?;
+    let (mut out, read) = onto_panels(sk, was, now, Some(&walls), drawn)?;
     // Nothing else may have been cut: a bend's material, or anything the panels' faces don't show.
     if walls.iter().any(|f| !read.claimed.contains(f)) {
         return Err("can't be kept in the sheet yet: it reaches a bend or a seam".into());
@@ -943,7 +976,7 @@ fn weighed(sk: &SurfaceSheet, out: &SurfaceSheet, built: &Body, now: &Body, shad
 /// body's two faces of a panel end apart at its outline (as a bent part drawn with sharp
 /// corners has them), that is how it was drawn, not a cut.
 pub(crate) fn engraved(sk: &SurfaceSheet, built: &Body, body: &Body) -> Result<(SurfaceSheet, Body)> {
-    let (mut out, _) = onto_panels(sk, built, body, None).map_err(DocError::Invalid)?;
+    let (mut out, _) = onto_panels(sk, built, body, None, None).map_err(DocError::Invalid)?;
     if out.recesses.is_empty() && out.sheet == sk.sheet {
         return Ok((out, built.clone()));
     }
@@ -1131,8 +1164,15 @@ fn holders(sk: &SurfaceSheet, p: usize) -> Vec<Vec2> {
 /// square (by their surfaces, see [`lean`], or by what its faces show), or the panel is a roll,
 /// what went through is the shadow they cast: of a bore lying in a flat panel, its band (see
 /// [`lying`]). Reading a converted body's engravings (no `walls`), a panel's walls must be
-/// square, away from its outline.
-fn onto_panels(sk: &SurfaceSheet, was: &Body, now: &Body, walls: Option<&[usize]>) -> std::result::Result<(SurfaceSheet, Read), String> {
+/// square, away from its outline. The extrude `drawn` that made the cut gives the floors it
+/// made their depths.
+fn onto_panels(
+    sk: &SurfaceSheet,
+    was: &Body,
+    now: &Body,
+    walls: Option<&[usize]>,
+    drawn: Option<&Drawn>,
+) -> std::result::Result<(SurfaceSheet, Read), String> {
     let strict = walls.is_some();
     let dev = sk.develop().map_err(|e| e.to_string())?;
     let frames = frames(sk, &dev).map_err(|e| e.to_string())?;
@@ -1241,7 +1281,7 @@ fn onto_panels(sk: &SurfaceSheet, was: &Body, now: &Body, walls: Option<&[usize]
         let (bands, bored) = lying(now, &qb, frame, t, &here, &panel.name, tol)?;
         let others: Vec<usize> = here.iter().copied().filter(|f| !bored.contains(f)).collect();
         let leaning = others.iter().any(|f| !matches!(lean(now, *f, frame.z, tol), Lean::Square));
-        let read = |b: &Body, q: &Query| on_panel(b, q, frame, t, std::slice::from_ref(&panel.region), tol).map_err(|e| e.to_string());
+        let read = |b: &Body, q: &Query| on_panel(b, q, frame, t, std::slice::from_ref(&panel.region), tol, drawn).map_err(|e| e.to_string());
         let (before, after) = (read(was, &qa)?, read(now, &qb)?);
         // The panel's flat material before the cut, and each face's after it (its own face, or
         // a floor seen from it).
@@ -1503,7 +1543,7 @@ fn flat_gone(
         return Ok(None);
     }
     let t = sk.sheet.thickness;
-    let read = |b: &Body, q: &Query| on_panel(b, q, &sk.flat, t, &sk.regions, tol).map_err(|e| e.to_string());
+    let read = |b: &Body, q: &Query| on_panel(b, q, &sk.flat, t, &sk.regions, tol, None).map_err(|e| e.to_string());
     let (before, after) = (read(was, qa)?, read(now, qb)?);
     let seen = |own: &[Region2], floors: &[(f64, Region2)]| {
         union(own.iter().cloned().chain(floors.iter().map(|x| x.1.clone())).collect(), tol).map_err(|e| e.to_string())
