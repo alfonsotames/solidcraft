@@ -253,10 +253,13 @@ fn as_drawn<'a>(inputs: impl Iterator<Item = &'a Region2>, out: Vec<Region2>) ->
 
 /// A loop's edges made to meet exactly where they meet within [`ONE_CORNER`]: the edge ending at
 /// a corner moved onto the start of the next, or, where it is an arc (whose ends its angles
-/// place), the next edge's start moved onto its end. The boolean reads each edge's ends to
-/// within the B-rep's tolerance, and an arc it fits ends near its corner, not on it. Left so, a
-/// step of a hair stays between neighbours: a smooth run of curves can't be followed across it,
-/// and the next boolean refuses a loop whose steps outgrow its own tolerance.
+/// place), the next edge's start moved onto its end. Two arcs both end where their circles meet
+/// at the corner (see [`circles_meet`]), each by its own angle: moving one arc's end along its
+/// circle onto the other's would leave the part of the step that lies across that circle. The
+/// boolean reads each edge's ends to within the B-rep's tolerance, and an arc it fits ends near
+/// its corner, not on it. Left so, a step of a hair stays between neighbours: a smooth run of
+/// curves can't be followed across it, and the next boolean refuses a loop whose steps outgrow
+/// its own tolerance.
 fn close_up(segs: &mut [Seg2]) {
     let n = segs.len();
     for i in 0..n {
@@ -266,16 +269,54 @@ fn close_up(segs: &mut [Seg2]) {
         if end == start || end.dist(start) > ONE_CORNER {
             continue;
         }
-        if !matches!(a, Seg2::Arc { .. }) {
-            if let Some(x) = segs.get_mut(i) {
-                *x = ending_at(a, a.start(), start);
+        match (a, b) {
+            (Seg2::Arc { center: ca, radius: ra, start: sa, sweep: wa }, Seg2::Arc { center: cb, radius: rb, start: sb, sweep: wb }) => {
+                // Two pieces of one circle (or circles that don't meet there) meet where the
+                // first ends.
+                let x = circles_meet((ca, ra), (cb, rb), end.lerp(start, 0.5)).unwrap_or(end);
+                let (ea, sb1) = (near_angle((x - ca).angle(), sa + wa), near_angle((x - cb).angle(), sb));
+                if let Some(s) = segs.get_mut(i) {
+                    *s = Seg2::Arc { center: ca, radius: ra, start: sa, sweep: ea - sa };
+                }
+                if let Some(s) = segs.get_mut(j) {
+                    *s = Seg2::Arc { center: cb, radius: rb, start: sb1, sweep: sb + wb - sb1 };
+                }
             }
-        } else if !matches!(b, Seg2::Arc { .. })
-            && let Some(x) = segs.get_mut(j)
-        {
-            *x = ending_at(b, end, b.end());
+            (Seg2::Arc { .. }, _) => {
+                if let Some(x) = segs.get_mut(j) {
+                    *x = ending_at(b, end, b.end());
+                }
+            }
+            _ => {
+                if let Some(x) = segs.get_mut(i) {
+                    *x = ending_at(a, a.start(), start);
+                }
+            }
         }
     }
+}
+
+/// Where the circle about `c0` of radius `r0` and the one about `c1` of radius `r1` meet nearest
+/// `near`: where they cross, or where they touch (for two read a hair apart, the point between
+/// them on the line through their centres). None where that is more than [`ONE_CORNER`] from
+/// `near`, and for circles about one centre.
+fn circles_meet((c0, r0): (Vec2, f64), (c1, r1): (Vec2, f64), near: Vec2) -> Option<Vec2> {
+    let u = (c1 - c0).normalized()?;
+    let l = (c1 - c0).len();
+    // From `c0` along the line of centres to the chord through the crossings, and half the chord.
+    let along = (r0 * r0 - r1 * r1 + l * l) / (2.0 * l);
+    let half = (r0 * r0 - along * along).max(0.0).sqrt();
+    let foot = c0 + u * along;
+    [foot + u.perp() * half, foot - u.perp() * half]
+        .into_iter()
+        .filter(|p| p.dist(near) <= ONE_CORNER)
+        .min_by(|p, q| p.dist(near).total_cmp(&q.dist(near)))
+}
+
+/// The angle `a`, turned by whole turns to lie within half a turn of `to`.
+fn near_angle(a: f64, to: f64) -> f64 {
+    let d = a - to;
+    to + d - std::f64::consts::TAU * (d / std::f64::consts::TAU).round()
 }
 
 /// The piece of one of `curves` that edge `s` runs along, from `s`'s start to its end: within
@@ -765,6 +806,33 @@ mod tests {
             let n = l.segs.len();
             assert!((0..n).all(|i| l.segs[i].end() == l.segs[(i + 1) % n].start()), "{l:?}");
         }
+    }
+
+    /// Two arcs that a loop's corner joins, each read a hair past or short of it, both end where
+    /// their circles meet there, each by its own angle, and keep their other ends.
+    #[test]
+    fn two_arcs_at_a_corner_end_where_their_circles_meet() {
+        use std::f64::consts::PI;
+
+        use solidcore_record::{Seg2, Vec2};
+        let arc = |x: f64, y: f64, radius: f64, start: f64, sweep: f64| Seg2::Arc { center: Vec2::new(x, y), radius, start, sweep };
+        let closed = |a: Seg2, b: Seg2, at: Vec2| {
+            assert!(a.end().dist(b.start()) > 1e-5, "{a:?} {b:?}");
+            let mut segs = vec![a, b, Seg2::Line { a: b.end(), b: a.start() }];
+            super::close_up(&mut segs);
+            assert!(segs[0].end().dist(at) < 1e-12 && segs[1].start().dist(at) < 1e-12, "{segs:?}");
+            assert!(segs[0].start().dist(a.start()) < 1e-12 && segs[1].end().dist(b.end()) < 1e-12, "{segs:?}");
+            assert!((0..3).all(|i| segs[i].end().dist(segs[(i + 1) % 3].start()) < 1e-12), "{segs:?}");
+        };
+        // Square across each other: up the circle about the origin to (0, 10), then on along the
+        // one about (10, 10), which crosses it there.
+        closed(arc(0.0, 0.0, 10.0, 0.0, FRAC_PI_2 + 3e-6), arc(10.0, 10.0, 10.0, PI + 2e-6, -FRAC_PI_2 - 2e-6), Vec2::new(0.0, 10.0));
+        // Smoothly into each other: along the circle about the origin to (0, 10), then along the
+        // one about (0, 20), which touches it there.
+        closed(arc(0.0, 0.0, 10.0, PI, -FRAC_PI_2 - 2e-6), arc(0.0, 20.0, 10.0, -FRAC_PI_2 - 3e-6, FRAC_PI_2 + 3e-6), Vec2::new(0.0, 10.0));
+        // Two pieces of one circle: the second starts where the first ends.
+        let first = arc(5.0, -3.0, 4.0, 0.0, 1.0 + 4e-6);
+        closed(first, arc(5.0, -3.0, 4.0, 1.0 - 3e-6, 1.0), first.end());
     }
 
     #[test]
