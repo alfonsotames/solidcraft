@@ -598,6 +598,10 @@ fn onto_panels(sk: &SurfaceSheet, was: &Body, now: &Body, walls: Option<&[usize]
             }
             groups.push((group, reach));
         }
+        // Laid out flat, the groups are read as one shadow, so that a strip's two sides close
+        // along the edge together. That is not one hole only: `assemble` joins the pieces into a
+        // loop per closed outline, so two cuts of one feature that don't meet still come out as
+        // two loops.
         if sk.unfolded && groups.len() > 1 {
             let one = groups.drain(..).fold((Vec::new(), BTreeSet::new()), |(mut g, mut r), (group, reach)| {
                 g.extend(group);
