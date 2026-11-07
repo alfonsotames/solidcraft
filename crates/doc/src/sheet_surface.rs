@@ -215,6 +215,14 @@ const ONE_CORNER: f64 = 1e-4;
 /// letter's flat curves) and splines to conics; here a Bézier stays a Bézier and a conic a
 /// conic, between the same corners, and the edges of each loop meet exactly (see
 /// [`close_up`]). An edge that follows no input curve is kept as read.
+///
+/// Until the kernel reads a span that merely lies near a circle as the span it is (#6748): it is
+/// the kernel's reader that breaks the planar booleans' own contract, that the result's
+/// boundaries are the operands' curves "never refitted" (`crates/kernel/src/prism.rs`).
+/// `segment` in `crates/kernel/src/prism_curve.rs` proposes a circle from samples and takes any
+/// span within `tol` of it as an arc. The fix belongs there, an arc only where the span's record
+/// curve is a circle or an exact rational-quadratic one, which would keep the 3D prism cut's
+/// curves too; that is a `crates/kernel` change, so the curves are given back here, a layer up.
 pub(crate) fn boolean_as_drawn(a: &[Region2], b: &[Region2], op: BoolOp, tol: f64) -> solidcraft_kernel::Result<Vec<Region2>> {
     let out = solidcraft_kernel::planar_regions_boolean(a, b, op, tol)?;
     Ok(as_drawn(a.iter().chain(b), out))
