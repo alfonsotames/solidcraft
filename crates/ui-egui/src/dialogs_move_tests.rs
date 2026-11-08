@@ -899,13 +899,18 @@ fn a_second_crossed_face_replaces_the_firsts_points() {
     let top = flat.iter().find(|f| (f.centroid.z - 10.0).abs() < 1e-6).unwrap();
     let side = flat.iter().find(|f| f.centroid.x.abs() < 1e-6).unwrap();
     let has = |h: &crate::scenario::Harness, at: Vec3| h.app.viewport.woken.points.iter().any(|p| p.at.dist(at) < 1e-6);
+    // A face's snap centre is its area centre from the snap's own tessellation, so it is only
+    // near the centroid of `faces` (a holed face differs by a few thousandths).
+    let has_centre = |h: &crate::scenario::Harness, at: Vec3| {
+        h.app.viewport.woken.points.iter().any(|p| p.kind == solidcraft_engine::snap::SnapKind::FaceCentre && p.at.dist(at) < 0.05)
+    };
     for (face, gone) in [(top, None), (side, Some(top.centroid))] {
         h.app.viewport.hover = Some(crate::viewport::Hit::Face { body: "Body1".into(), index: face.index, point: face.centroid });
         crate::snap_wake::update(&mut h.app, &[]);
         assert!(has(&h, rim_centre), "the rim's centre stays: {:?}", h.app.viewport.woken);
-        assert!(has(&h, face.centroid), "the face's centre wakes: {:?}", h.app.viewport.woken);
+        assert!(has_centre(&h, face.centroid), "the face's centre wakes: {:?}", h.app.viewport.woken);
         if let Some(at) = gone {
-            assert!(!has(&h, at), "the first face's centre sleeps: {:?}", h.app.viewport.woken);
+            assert!(!has_centre(&h, at), "the first face's centre sleeps: {:?}", h.app.viewport.woken);
         }
     }
 }
