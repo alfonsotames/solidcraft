@@ -53,6 +53,7 @@ fn bend(angle: f64, datum: Datum, span: (f64, f64)) -> Bend {
         ends: ZoneEnds { near: span, far: span },
         tails: (Tail::Keep, Tail::Trim),
         relief: (Relief::None, Relief::None),
+        end_curves: (Vec::new(), Vec::new()),
     }
 }
 
@@ -172,6 +173,63 @@ fn a_torn_end_slants_the_zone() {
     let ba = FRAC_PI_2 * (R + K * T);
     let [zone] = dev.zones.as_slice() else { panic!() };
     assert!((zone.region.area() - ba * (90.0 + 95.0) / 2.0).abs() < 1e-9, "{}", zone.region.area());
+}
+
+/// A disc folded off its center, as a fold across a curved outline leaves it: the zone's ends
+/// follow the circle (`end_curves`), so the zone is the disc's own strip, its bend line reaches
+/// the circle, and the disc lays out flat whole. End curves that don't meet the zone's corners
+/// are refused.
+#[test]
+fn a_zone_whose_ends_follow_the_outline_is_the_sheets_own_strip() {
+    let (r, x) = (50.0_f64, 10.0_f64);
+    let ba = FRAC_PI_2 * (R + K * T);
+    let (s0, s1) = (x - ba / 2.0, x + ba / 2.0);
+    let y = |s: f64| (r * r - s * s).sqrt();
+    let angle = |s: f64, up: bool| (if up { y(s) } else { -y(s) }).atan2(s);
+    // The circle from where it meets one line to where it meets another, the short way.
+    let arc = |(s, up): (f64, bool), (e, eup): (f64, bool)| Seg2::Arc {
+        center: Vec2::ZERO,
+        radius: r,
+        start: angle(s, up),
+        sweep: angle(e, eup) - angle(s, up),
+    };
+    let at = |s: f64, up: bool| Vec2::new(s, if up { y(s) } else { -y(s) });
+    // The disc short of the zone, and past it.
+    let theta0 = angle(s0, true);
+    let left = Seg2::Arc { center: Vec2::ZERO, radius: r, start: theta0, sweep: 2.0 * (PI - theta0) };
+    let right = Seg2::Arc { center: Vec2::ZERO, radius: r, start: angle(s1, false), sweep: 2.0 * angle(s1, true) };
+    let region = |segs: Vec<Seg2>| Region2 { outer: Loop2 { segs }, holes: Vec::new() };
+    let panels = vec![
+        Panel { name: "stays".into(), region: region(vec![left, Seg2::Line { a: at(s0, false), b: at(s0, true) }]), ..Panel::default() },
+        Panel { name: "folds".into(), region: region(vec![right, Seg2::Line { a: at(s1, true), b: at(s1, false) }]), ..Panel::default() },
+    ];
+    let start = -y(s0);
+    let mut b = bend(FRAC_PI_2, Datum::Tangent, (0.0, 2.0 * y(s0)));
+    b.ends.far = (y(s0) - y(s1), y(s0) + y(s1));
+    b.tails = (Tail::Keep, Tail::Keep);
+    b.end_curves = (vec![arc((s0, false), (s1, false))], vec![arc((s0, true), (s1, true))]);
+    let joint = |b: Bend| Joint {
+        a: Anchor { panel: 0, origin: Vec2::new(s0, start), dir: Vec2::Y },
+        b: Anchor { panel: 1, origin: Vec2::new(s1, start), dir: Vec2::Y },
+        kind: JointKind::Bend(b),
+    };
+    let sheet = |b: Bend| Sheet { thickness: T, k_factor: K, panels: panels.clone(), joints: vec![joint(b)], corners: Vec::new(), cuts: Vec::new() };
+    let dev = develop(&sheet(b.clone()), 0).unwrap_or_default();
+    let [zone] = dev.zones.as_slice() else { panic!("one zone: {:?}", dev.zones) };
+    // The circle's own strip: ∫ 2√(r² − s²) ds across the zone.
+    let integral = |s: f64| s * y(s) + r * r * (s / r).asin();
+    let strip = integral(s1) - integral(s0);
+    assert!((zone.region.area() - strip).abs() < 1e-9, "{} vs {strip}", zone.region.area());
+    // Straight ends would have cut the circle's segments off it.
+    let chords = (s1 - s0) * (y(s0) + y(s1));
+    assert!(strip - chords > 1e-6, "{strip} vs {chords}");
+    assert!(near(zone.middle[0], at(x, false)) && near(zone.middle[1], at(x, true)), "{:?}", zone.middle);
+    let area: f64 = dev.panels.iter().flatten().map(|p| p.region.area()).sum::<f64>() + zone.region.area();
+    assert!((area - PI * r * r).abs() < 1e-6, "{area} vs {}", PI * r * r);
+    // An end curve that misses its corner by a micrometre.
+    let mut off = b;
+    off.end_curves.0 = vec![arc((s0 + 1e-3, false), (s1, false))];
+    assert!(matches!(develop(&sheet(off), 0), Err(DevelopError::Joint(0, _))));
 }
 
 /// A zone that stops short of the base's edge: past it the base keeps its tail, out to its sharp,

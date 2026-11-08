@@ -494,6 +494,7 @@ impl SurfaceSheet {
             ends: ZoneEnds { near: (0.0, len), far: (0.0, len) },
             tails: (Tail::Keep, Tail::Keep),
             relief: (Relief::None, Relief::None),
+            end_curves: (Vec::new(), Vec::new()),
         };
         // Its sides carry on the edges beside it, as laid out in the flat with the bend: through
         // the anchor's ends on the plate, `slant` along for each mm out (square where those
@@ -779,6 +780,7 @@ impl SurfaceSheet {
             ends: ZoneEnds { near: (0.0, 0.0), far: (0.0, 0.0) },
             tails: (Tail::Keep, Tail::Keep),
             relief: (Relief::None, Relief::None),
+            end_curves: (Vec::new(), Vec::new()),
         };
         let ba = bend.allowance(t, self.sheet.k_factor);
         let s0 = match position {
@@ -840,20 +842,29 @@ impl SurfaceSheet {
         };
         let reach = |s: f64| crate::sheet_surface_convert::extent_across(&region, (n * s, u));
         let (Some(near_all), Some(far_all)) = (reach(s0), reach(s0 + ba)) else { return err("the fold's bend zone runs off its panel") };
-        // Each piece's stretch along the line, and its zone there.
+        // Each piece's stretch along the line, and its zone there. Where the outline crosses the
+        // zone on its own, each zone is the panel's material there exactly (see `held_zones`):
+        // its ends the outline's own curves, a slanted end as far as it runs. Otherwise it is
+        // the strip across its piece's stretch.
+        let spans: Vec<(f64, f64)> = moves.iter().map(&span).collect();
+        let held = if moves.len() == all_moving.len() { held_zones(&region, n, s0, ba, &spans) } else { None };
         let mut bends = Vec::with_capacity(moves.len());
-        for piece in &moves {
-            let along: Vec<f64> = (&piece.outer.polyline(1e-4)).into_iter().map(|q| q.dot(u)).collect();
-            let (lo, hi) = (along.iter().copied().fold(f64::MAX, f64::min), along.iter().copied().fold(f64::MIN, f64::max));
-            let clip = |(a, b): (f64, f64)| (a.max(lo), b.min(hi));
-            let (near, far) = (clip(near_all), clip(far_all));
+        for (k, &(lo, hi)) in spans.iter().enumerate() {
+            let (near, far, [low_end, high_end], (start, stop)) = match held.as_ref().and_then(|h| h.get(k)) {
+                Some(z) => (z.near, z.far, z.ends.clone(), z.reach),
+                None => {
+                    let clip = |(a, b): (f64, f64)| (a.max(lo), b.min(hi));
+                    let (near, far) = (clip(near_all), clip(far_all));
+                    (near, far, [Vec::new(), Vec::new()], (near.0.min(far.0), near.1.max(far.1)))
+                }
+            };
             if !(near.0 < near.1 && far.0 < far.1) {
                 return err("the fold's bend zone runs off its panel");
             }
-            let start = near.0.min(far.0);
             let mut bend = bend.clone();
             bend.ends = ZoneEnds { near: (near.0 - start, near.1 - start), far: (far.0 - start, far.1 - start) };
-            bend.length = near.1.max(far.1) - start;
+            bend.length = stop - start;
+            bend.end_curves = (low_end, high_end);
             bends.push((bend, start, lo, hi));
         }
         let first = self.sheet.panels.len();
@@ -878,6 +889,7 @@ impl SurfaceSheet {
                 _ => (None, None),
             };
             let (end_a, end_b) = (ends(&joint.a, rip_ends.0.as_ref()), ends(&joint.b, rip_ends.1.as_ref()));
+            let through_bend = matches!(joint.kind, JointKind::Bend(_));
             for (an, end) in [(&mut joint.a, end_a), (&mut joint.b, end_b)] {
                 if an.panel != i {
                     continue;
@@ -885,6 +897,8 @@ impl SurfaceSheet {
                 let (s, e) = (side(an.origin), side(end));
                 if s.min(e) >= ba - tol {
                     an.panel = piece_at(an.origin);
+                } else if s.max(e) > tol && through_bend {
+                    return err("not supported yet: a fold through a flange's bend");
                 } else if s.max(e) > tol {
                     return err("the fold's bend zone reaches or crosses another joint of its panel: not supported yet");
                 }
@@ -1040,6 +1054,10 @@ impl SurfaceSheet {
                     b.ends = ZoneEnds { near: (l - b.ends.near.1, l - b.ends.near.0), far: (l - b.ends.far.1, l - b.ends.far.0) };
                     b.tails = (b.tails.1, b.tails.0);
                     b.relief = (b.relief.1, b.relief.0);
+                    // Each end still runs from the `a` side to the `b` side, turned over with
+                    // its chart.
+                    let over = |c: &[Seg2]| c.iter().map(|s| turned_over(s, f)).collect::<Vec<_>>();
+                    b.end_curves = (over(&b.end_curves.1), over(&b.end_curves.0));
                 }
                 JointKind::Seam => {
                     turn(&mut j.a, 0.0);
@@ -1430,8 +1448,106 @@ impl SurfaceSheet {
             ends: ZoneEnds { near: (0.0, len), far: (0.0, len) },
             tails: (Tail::Keep, Tail::Keep),
             relief: (Relief::None, Relief::None),
+            end_curves: (Vec::new(), Vec::new()),
         };
         Ok(self.add_panel("hem", &edge, a, d, len, leg, bend))
+    }
+}
+
+/// A fold's bend zone where a panel's outline crosses it on its own (see [`held_zones`]): where
+/// it runs along the zone's two lines (`near` on the side that stays, `far` on the side that
+/// moves, in lengths along the fold line), its two ends exactly, each from the near line to the
+/// far line, the one lower along the fold line first (empty where an end is one straight line),
+/// and how far it reaches along the fold line.
+struct HeldZone {
+    near: (f64, f64),
+    far: (f64, f64),
+    ends: [Vec<Seg2>; 2],
+    reach: (f64, f64),
+}
+
+/// The material of `region` in a fold's bend zone, between the lines `x · n = s0` and
+/// `x · n = s0 + ba` (`n` a unit vector, the side that moves along it), as one zone for each
+/// stretch of the moving side along the fold line (`spans`, lengths along `n.perp()`): the
+/// region's outline (its holes go as cuts) cut exactly by the two lines, so that each zone keeps
+/// the outline's own curves and its corners are the panels'. `None` unless each piece of it runs
+/// from one line to the other along the outline at either end and holds exactly one stretch, and
+/// each stretch is held by one.
+fn held_zones(region: &Region2, n: Vec2, s0: f64, ba: f64, spans: &[(f64, f64)]) -> Option<Vec<HeldZone>> {
+    let u = n.perp();
+    // As `half` cuts the panel at either line, so that the zones' corners are the panels'.
+    let b = region.outer.polyline(1e-3).bounds();
+    let big = (b.size().len() + b.min.len() + b.max.len() + 1.0) * 4.0;
+    let tol = (b.size().len() * 1e-9).max(1e-9);
+    let strip = Loop2::polygon(&[n * s0 - u * big, n * s0 + u * big, n * (s0 + ba) + u * big, n * (s0 + ba) - u * big]).ccw();
+    let outline = Region2 { outer: region.outer.clone(), holes: Vec::new() };
+    let parts = solidcraft_kernel::planar_regions_boolean(&[outline], &[Region2 { outer: strip, holes: Vec::new() }], BoolOp::Intersect, tol).ok()?;
+    let on = (b.size().len() * 1e-9).max(1e-7);
+    let mut held: Vec<Option<HeldZone>> = spans.iter().map(|_| None).collect();
+    for part in parts {
+        let z = zone_of(&part.outer.ccw(), n, (s0, s0 + ba), on)?;
+        let mid = (z.far.0 + z.far.1) / 2.0;
+        let k = spans.iter().position(|(lo, hi)| mid >= *lo - on && mid <= *hi + on)?;
+        let slot = held.get_mut(k)?;
+        if slot.is_some() {
+            return None;
+        }
+        *slot = Some(z);
+    }
+    held.into_iter().collect()
+}
+
+/// A piece of a panel in a fold's bend zone (see [`held_zones`]), from its outline: counter-
+/// clockwise, the moving side along `n`, it runs down the near line (against `n.perp()`),
+/// across the zone at its lower end, up the far line and back across at its upper end. `None`
+/// for any other course, such as an outline that turns back inside the zone. Edges within `on`
+/// of a line run along it.
+fn zone_of(outer: &Loop2, n: Vec2, (s0, s1): (f64, f64), on: f64) -> Option<HeldZone> {
+    let u = n.perp();
+    let along = |s: &Seg2, at: f64| matches!(s, Seg2::Line { .. }) && (s.start().dot(n) - at).abs() <= on && (s.end().dot(n) - at).abs() <= on;
+    // 0 along the near line, 1 along the far line, 2 across the zone.
+    let kinds: Vec<u8> = outer
+        .segs
+        .iter()
+        .map(|s| {
+            if along(s, s0) {
+                0
+            } else if along(s, s1) {
+                1
+            } else {
+                2
+            }
+        })
+        .collect();
+    let count = kinds.len();
+    let first = (0..count).find(|&i| kinds.get(i) != Some(&0) && kinds.get((i + count - 1) % count) == Some(&0))?;
+    let mut runs: Vec<(u8, Vec<Seg2>)> = Vec::new();
+    for k in 0..count {
+        let i = (first + k) % count;
+        let (kind, seg) = (*kinds.get(i)?, *outer.segs.get(i)?);
+        match runs.last_mut() {
+            Some((c, run)) if *c == kind => run.push(seg),
+            _ => runs.push((kind, vec![seg])),
+        }
+    }
+    let [(2, low), (1, far), (2, high), (0, near)] = runs.as_slice() else { return None };
+    let ends = |run: &[Seg2]| Some((run.first()?.start().dot(u), run.last()?.end().dot(u)));
+    let ((n_hi, n_lo), (f_lo, f_hi)) = (ends(near)?, ends(far)?);
+    let reach = (&outer.polyline(1e-6)).into_iter().map(|q| q.dot(u)).fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), x| (lo.min(x), hi.max(x)));
+    // The upper end from the near line to the far one, as the lower one runs.
+    let high: Vec<Seg2> = high.iter().rev().map(Seg2::reversed).collect();
+    let exact = |run: Vec<Seg2>| if matches!(run.as_slice(), [Seg2::Line { .. }]) { Vec::new() } else { run };
+    Some(HeldZone { near: (n_lo, n_hi), far: (f_lo, f_hi), ends: [exact(low.clone()), exact(high)], reach })
+}
+
+/// `s` mapped by `f`, a mirror of the plane, the same way along: an arc turns the other way round
+/// its mirrored centre.
+fn turned_over(s: &Seg2, f: impl Fn(Vec2) -> Vec2) -> Seg2 {
+    let (o, x) = (f(Vec2::ZERO), f(Vec2::new(1.0, 0.0)));
+    let rot = (x - o).angle();
+    match *s {
+        Seg2::Arc { center, radius, start, sweep } => Seg2::Arc { center: f(center), radius, start: rot - start, sweep: -sweep },
+        other => other.map_controls(&f),
     }
 }
 

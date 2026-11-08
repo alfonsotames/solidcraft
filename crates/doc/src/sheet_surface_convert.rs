@@ -1545,6 +1545,7 @@ pub fn convert_surfaces(
                 ends: ZoneEnds { near: (0.0, len), far: (0.0, len) },
                 tails: (Tail::Keep, Tail::Keep),
                 relief: (Relief::None, Relief::None),
+                end_curves: (Vec::new(), Vec::new()),
             };
             // A wall standing on part of the other panel's edge, its outside in one plane with
             // that edge where it runs on past the wall, bends only where it stands. Past the
@@ -1639,6 +1640,7 @@ pub fn convert_surfaces(
             ends: ZoneEnds { near: (0.0, len), far: (0.0, len) },
             tails: (Tail::Keep, Tail::Keep),
             relief: (Relief::None, Relief::None),
+            end_curves: (Vec::new(), Vec::new()),
         };
         modelled_radii.push((joints.len(), m.inside));
         joints.push(Joint {
@@ -2398,6 +2400,7 @@ impl SurfaceSheet {
                 ends: ZoneEnds { near: (0.0, width), far: (0.0, width) },
                 tails: (Tail::Keep, Tail::Keep),
                 relief: (Relief::None, Relief::None),
+                end_curves: (Vec::new(), Vec::new()),
             };
             let (a, b) = (Anchor { panel: i, origin: a0, dir: dir_a }, Anchor { panel: i + 1, origin: b0, dir: dir_b });
             joints.push(Joint { a, b, kind: JointKind::Bend(bend) });
@@ -2801,8 +2804,8 @@ impl SurfaceSheet {
                 let JointKind::Bend(b) = &self.sheet.joints.get(z.joint)?.kind else { return None };
                 Some(SurfaceBendLine {
                     zone: z.region.clone(),
-                    start: (z.near[0] + z.far[0]) * 0.5,
-                    end: (z.near[1] + z.far[1]) * 0.5,
+                    start: z.middle[0],
+                    end: z.middle[1],
                     angle: b.angle,
                     radius: b.radius,
                     // Up toward the reader of the flat, who sees it from the surface (see

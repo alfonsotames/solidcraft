@@ -203,6 +203,18 @@ pub struct Bend {
     pub tails: (Tail, Tail),
     /// What is cut at each of the zone's ends, `(start, end)` along the joint.
     pub relief: (Relief, Relief),
+    /// Each end of the zone where it follows the sheet's outline across the zone, `(start, end)`
+    /// along the joint: the outline's own curves, in the `a` panel's parameters, from the end's
+    /// point on the `a` panel's tangent line to its point on the `b` panel's (see [`ZoneEnds`]).
+    /// A fold across a curved outline keeps them, so that its flat stays the blank as drawn.
+    /// Empty where the end runs straight from the one point to the other, or as its relief
+    /// tears it.
+    #[serde(default, skip_serializing_if = "straight_ends")]
+    pub end_curves: (Vec<Seg2>, Vec<Seg2>),
+}
+
+fn straight_ends(c: &(Vec<Seg2>, Vec<Seg2>)) -> bool {
+    c.0.is_empty() && c.1.is_empty()
 }
 
 /// What is cut at one end of a bend's zone, from both its panels alike. Reliefs are the bend's,

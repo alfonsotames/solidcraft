@@ -24,6 +24,9 @@ const REACH_TOL: f64 = 1e-3;
 /// A panel's edge this close (mm) to a bend zone's end ends with it.
 const EDGE_TOL: f64 = 1e-6;
 
+/// How far (mm) a bend zone's end curves may end from the points of its tangent lines they join.
+const END_CURVE_TOL: f64 = 1e-6;
+
 /// How far (mm) a rip's cut points may lie off the line through its ends and still be drawn as it.
 const RIP_TOL: f64 = 1e-9;
 
@@ -84,13 +87,15 @@ pub enum EdgeFrom {
 
 /// A bend's zone in the flat frame: its region, its edge on the `a` panel's side (`near`) and on
 /// the `b` panel's side (`far`), each from the end at the anchors' origin to the other, and the
-/// panels on those sides. Its ends join `near[k]` to `far[k]`.
+/// panels on those sides. Its ends join `near[k]` to `far[k]`. `middle` is its center line, the
+/// bend line, from where it meets the end at the anchors' origin to where it meets the other.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Zone {
     pub joint: usize,
     pub region: Region2,
     pub near: [Vec2; 2],
     pub far: [Vec2; 2],
+    pub middle: [Vec2; 2],
     pub panels: [usize; 2],
 }
 
@@ -421,7 +426,8 @@ fn check_joint(sheet: &Sheet, j: usize, joint: &Joint) -> Result<(), DevelopErro
                 return Err(DevelopError::Joint(j, "a half turn has no virtual sharp: anchor it at its tangent lines"));
             }
             let (near, far) = (bend.ends.near, bend.ends.far);
-            if ![near.0, near.1, far.0, far.1].iter().all(|v| v.is_finite()) {
+            let finite = |s: &Seg2| s.start().is_finite() && s.end().is_finite();
+            if ![near.0, near.1, far.0, far.1].iter().all(|v| v.is_finite()) || !bend.end_curves.0.iter().chain(&bend.end_curves.1).all(finite) {
                 return Err(DevelopError::Joint(j, "the zone's ends are not numbers"));
             }
             let flat = |a: &Anchor| sheet.panels.get(a.panel).is_some_and(|p| p.surface == Surface::Plane);
@@ -877,21 +883,62 @@ fn add_zone(
     let (near, far) = (bend.ends.near, bend.ends.far);
     if width > 0.0 && (near.1 > near.0 || far.1 > far.0) {
         let (n0, n1, f0, f1) = (frame.at(near.0, near_line), frame.at(near.1, near_line), frame.at(far.0, far_line), frame.at(far.1, far_line));
-        // Each end straight across, or torn along the curve it follows; the loop runs along the
-        // `a` side, up the end, back along the `b` side and down the start.
-        let end = |relief: &Relief, (from, to): (f64, f64)| match *relief {
-            Relief::Tear { normal, offset } => torn(sheet, bend, frame, (normal, offset), (from, to)),
-            _ => vec![Seg2::Line { a: frame.at(from, near_line), b: frame.at(to, far_line) }],
+        // An end that follows the outline: its curves carried into the flat. They must run from
+        // the end's point on the `a` panel's tangent line to its point on the `b` panel's.
+        let follows = |curves: &[Seg2], from: Vec2, to: Vec2| -> Result<Option<Vec<Seg2>>, DevelopError> {
+            let flat: Vec<Seg2> = curves.iter().map(|s| placed.0.seg(s)).collect();
+            match (flat.first(), flat.last()) {
+                (Some(first), Some(last)) if first.start().dist(from) <= END_CURVE_TOL && last.end().dist(to) <= END_CURVE_TOL => Ok(Some(flat)),
+                (Some(_), Some(_)) => {
+                    Err(DevelopError::Joint(j, "an end curve of the bend's zone doesn't run from one of its tangent lines to the other"))
+                }
+                _ => Ok(None),
+            }
+        };
+        let tears = |r: &Relief| matches!(r, Relief::Tear { .. });
+        let curves = [
+            if tears(&bend.relief.0) { None } else { follows(&bend.end_curves.0, n0, f0)? },
+            if tears(&bend.relief.1) { None } else { follows(&bend.end_curves.1, n1, f1)? },
+        ];
+        // The corners where the curves have them, so that the loop closes exactly.
+        let corner = |k: usize, last: bool, at: Vec2| {
+            curves.get(k).and_then(Option::as_ref).and_then(|c| if last { c.last().map(Seg2::end) } else { c.first().map(Seg2::start) }).unwrap_or(at)
+        };
+        let (n0, f0, n1, f1) = (corner(0, false, n0), corner(0, true, f0), corner(1, false, n1), corner(1, true, f1));
+        // Each end straight across, along the outline's curves or torn along the curve it
+        // follows; the loop runs along the `a` side, up the end, back along the `b` side and down
+        // the start.
+        let end = |k: usize, relief: &Relief, (from, to): (Vec2, Vec2)| match (*relief, curves.get(k).and_then(Option::as_ref)) {
+            (Relief::Tear { normal, offset }, _) => {
+                let (u0, u1) = if k == 0 { (near.0, far.0) } else { (near.1, far.1) };
+                torn(sheet, bend, frame, (normal, offset), (u0, u1))
+            }
+            (_, Some(c)) => c.clone(),
+            _ => vec![Seg2::Line { a: from, b: to }],
         };
         let mut segs = vec![Seg2::Line { a: n0, b: n1 }];
-        segs.extend(end(&bend.relief.1, (near.1, far.1)));
+        segs.extend(end(1, &bend.relief.1, (n1, f1)));
         segs.push(Seg2::Line { a: f1, b: f0 });
-        segs.extend(end(&bend.relief.0, (near.0, far.0)).iter().rev().map(Seg2::reversed));
+        segs.extend(end(0, &bend.relief.0, (n0, f0)).iter().rev().map(Seg2::reversed));
+        // The bend line, halfway between the tangent lines: from end to end, where it meets an
+        // end that follows the outline (the outermost meeting, where a curve meets it more than
+        // once), else halfway along the end.
+        let middle = {
+            let half = (near_line + far_line) / 2.0;
+            let reach = [near.0, near.1, far.0, far.1].iter().fold(0.0_f64, |m, v| m.max(v.abs())) + bend.length.abs() + width + 1.0;
+            let line = [Seg2::Line { a: frame.at(-reach, half), b: frame.at(reach, half) }];
+            [(0, n0, f0), (1, n1, f1)].map(|(k, n, f)| {
+                let met = curves.get(k).and_then(Option::as_ref).map(|c| crossings(&line, c)).unwrap_or_default();
+                let outer = if k == 0 { met.iter().min_by(|x, y| x.1.total_cmp(&y.1)) } else { met.iter().max_by(|x, y| x.1.total_cmp(&y.1)) };
+                outer.map_or((n + f) * 0.5, |m| m.4)
+            })
+        };
         out.zones.push(Zone {
             joint: j,
             region: Region2 { outer: Loop2 { segs }.ccw(), holes: Vec::new() },
             near: [n0, n1],
             far: [f0, f1],
+            middle,
             panels: [joint.a.panel, joint.b.panel],
         });
     }

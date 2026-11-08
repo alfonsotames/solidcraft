@@ -111,6 +111,7 @@ impl BendFrame {
             ends: ZoneEnds { near: (0.0, 0.0), far: (0.0, 0.0) },
             tails: (Tail::Keep, Tail::Trim),
             relief: (Relief::None, Relief::None),
+            end_curves: (Vec::new(), Vec::new()),
         };
         let setback = bend.setback(sh.t);
         let width = sh.allowance(f);

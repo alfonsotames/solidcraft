@@ -31,6 +31,11 @@ const ON_CURVE: f64 = 1e-9;
 /// leaves its points about 1e-9 off where they would be exactly; a wall taken for a cone that near
 /// its plane would be a cone with no height (a half angle of 90°), which no kernel takes.
 const IN_PLANE: f64 = 1e-7;
+/// How far an edge's arcs on the two faces of the sheet may turn from one axis or lie off it (a
+/// sine, and a fraction of the radius), and the line between their starts run out of a plane
+/// through it (as the kernel measures it: the cross product of the two ends' offsets from the
+/// axis, over the square of the longer), and the wall between them still be the cone round it.
+const ON_AXIS: f64 = 1e-9;
 /// How far (mm) a chain of pieces may lie from the folded edge it stands in for.
 const CHAIN_TOL: f64 = 1e-7;
 /// The degree of a chain's pieces. Fitted pieces of degree 7 follow a helix round a whole bend
@@ -275,7 +280,11 @@ impl Folded<'_> {
     /// split alike, so that a ruled wall joins them piece by piece.
     fn edges(&self, piece: Piece, run: &[Seg2]) -> Result<[EdgeSpec; 2]> {
         let sampled = |depth: f64| (0..=SAMPLES).map(|k| self.at(piece, run_at(run, k as f64 / SAMPLES as f64), depth)).collect::<Result<Vec<_>>>();
-        if let (Some(surface), Some(deep)) = (simple(&sampled(0.0)?), simple(&sampled(self.t)?)) {
+        // A short stretch of a helix lies as near a circle as that: it is taken for an arc only
+        // where the wall to its arc a thickness in is a surface (see `wall`).
+        if let (Some(surface), Some(deep)) = (simple(&sampled(0.0)?), simple(&sampled(self.t)?))
+            && wall(&surface, &deep).is_ok()
+        {
             return Ok([surface, deep]);
         }
         // Equal pieces of each of the run's segments, as few as keep within the tolerance at
@@ -501,7 +510,18 @@ fn wall(bottom: &EdgeSpec, top: &EdgeSpec) -> Result<SurfSpec> {
             if (tb - b - d).len() <= ON_CURVE && (tm - mid - d).len() <= ON_CURVE {
                 return Ok(SurfSpec::Extruded { a, b, mid, dir: d });
             }
-            // Round the same axis: a circle round a cone, its wall a cone of its own.
+            // Round the same axis: a circle round a cone, its wall a cone of its own, revolved
+            // from the line between the two arcs' starts. The arcs must share their axis, and
+            // that line lie in a plane through it as the kernel measures it: two arcs round
+            // different axes (short stretches of two helices across a bend) have no such wall.
+            let (tc, tn) = circle(ta, tm, tb).ok_or_else(|| DocError::Invalid("an arc of the folded sheet has no circle".into()))?;
+            let foot = |p: Vec3| c + n * (p - c).dot(n);
+            let (ra, rt) = (a - foot(a), ta - foot(ta));
+            let scale = ra.len().max(rt.len());
+            let shared = tn.cross(n).len() <= ON_AXIS && (tc - foot(tc)).len() <= ON_AXIS * scale.max(1.0);
+            if !shared || ra.cross(rt).len() > ON_AXIS * scale * scale || ra.dot(rt) < 0.0 {
+                return Err(DocError::Invalid("an edge of the folded sheet folds to arcs round two axes".into()));
+            }
             let (e1, e2) = ((a - c).normalized().unwrap_or(Vec3::X), n.cross((a - c).normalized().unwrap_or(Vec3::X)));
             let angle = (b - c).dot(e2).atan2((b - c).dot(e1)).rem_euclid(std::f64::consts::TAU);
             Ok(SurfSpec::Revolved { a, b: ta, axis_origin: c, axis: n, angle })
@@ -536,6 +556,7 @@ mod tests {
             ends: ZoneEnds { near: (0.0, 100.0), far: (0.0, 100.0) },
             tails: (Tail::Keep, Tail::Trim),
             relief: (Relief::None, Relief::None),
+            end_curves: (Vec::new(), Vec::new()),
         };
         let sheet = Sheet {
             thickness: 2.0,
