@@ -3140,10 +3140,21 @@ fn pick_hits(app: &SolveApp, proj: &Proj, pos: Pos2, other_sketch_points: bool, 
     let point_slack = |body: &str| {
         st.bodies.iter().enumerate().find(|(_, b)| b.name == body).and_then(|(i, b)| body_box(i, b)).map_or(slack, |bb| pick_slack(bb.diagonal()))
     };
+    // A vertex of another body nearer than a woken point comes before it, even within a woken
+    // point's own few pixels: it is the one the pointer is on, and it puts the woken points to
+    // sleep (`snap_wake::update`).
+    let woken_body = app.viewport.woken.points.first().map(|p| p.body.as_str()).filter(|b| !b.is_empty());
+    let other_vertex = bestv
+        .v
+        .iter()
+        .filter(|(_, h)| matches!(h, Hit::Vertex { body, .. } if !body.is_empty() && woken_body.is_some_and(|w| w != body)))
+        .map(|x| x.0)
+        .fold(f32::INFINITY, f32::min);
     let (woken, behind_points): (Vec<_>, Vec<_>) = crate::snap_wake::hits(app, proj, pos)
         .into_iter()
         .filter(|(dd, h, kind)| {
-            (*dd < crate::snap_wake::ON || *dd < edge_near)
+            *dd < other_vertex
+                && (*dd < crate::snap_wake::ON || *dd < edge_near)
                 && matches!(h, Hit::Vertex { body, point } if visible(*point, point_slack(body))
                     || (kept(*point) && own_face_in_front && *kind == solidcraft_engine::snap::SnapKind::Centre))
         })
@@ -5029,7 +5040,11 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
     app.viewport.hover = cand.as_ref().map(|c| c.0.clone());
     wake_centre(app, &hits);
 
-    crate::snap_wake::update(app, &hits);
+    let keep = crate::tool_modifiers::keep_snap_points(crate::tool_modifiers::Held::new(
+        ui.input(|i| i.modifiers),
+        crate::tool_modifiers::Platform::of(ui.ctx()),
+    ));
+    crate::snap_wake::update(app, &hits, keep, hover.filter(|_| inside).map(|p| (&proj, p)));
     // Select Other: a press held still opens the list of everything under it; while the list is
     // open its row under the pointer is what lights up. A mode lit in the navigation bar or a
     // held Space owns drags, not a still press, so only a navigation that has started cancels
