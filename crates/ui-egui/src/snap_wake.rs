@@ -12,8 +12,8 @@ use solidcraft_engine::Sel;
 use solidcraft_engine::snap::{SnapKind, SnapPoint, snap_points};
 
 use crate::SolveApp;
-use crate::theme::Tokens;
 use crate::viewport::{Hit, Proj};
+use solidcraft_theme::Tokens;
 
 /// How far from the pointer a woken point is picked (screen points): twice a vertex's reach.
 pub const REACH: f32 = 16.0;
@@ -88,12 +88,12 @@ pub fn update(app: &mut SolveApp, hits: &[Hit]) {
     }
     // Crossing a face of the rim's own body on the way to its centre keeps the rim's points and
     // adds the face's; a face of another body sleeps them and wakes its own.
-    let points = snap_points(&app.session, &item);
+    let points = snap_points(&app.session, &in_model(app, &item));
     if let Sel::Face { body: face_body, .. } = &item
         && let Some(rim) = app.viewport.woken.item.clone().filter(|w| matches!(w, Sel::Edge { body, .. } if body == face_body))
     {
         // The rim's own points, without any an earlier crossed face added; then this face's.
-        let rim_points = snap_points(&app.session, &rim);
+        let rim_points = snap_points(&app.session, &in_model(app, &rim));
         let w = &mut app.viewport.woken;
         w.points = rim_points;
         for p in points {
@@ -106,6 +106,21 @@ pub fn update(app: &mut SolveApp, hits: &[Hit]) {
         return;
     }
     app.viewport.woken = Woken { item: Some(item), face: None, points, revision: app.session.revision };
+}
+
+/// A hovered item taken back to where the design keeps it: on a body a Move dialog moves, the
+/// item is picked where the move so far draws the body (see [`shown`]), and its points are
+/// found on the design.
+fn in_model(app: &SolveApp, item: &Sel) -> Sel {
+    let Some((bodies, back)) = crate::dialogs_move::chained(app).and_then(|(b, m)| Some((b, solidcraft_engine::doc::mat_inverse(&m)?))) else {
+        return item.clone();
+    };
+    let undo = |p: &Vec3| solidcraft_engine::doc::apply_point(&back, *p);
+    match item {
+        Sel::Edge { body, index, point } if bodies.contains(body) => Sel::Edge { body: body.clone(), index: *index, point: undo(point) },
+        Sel::Face { body, index, point } if bodies.contains(body) => Sel::Face { body: body.clone(), index: *index, point: undo(point) },
+        other => other.clone(),
+    }
 }
 
 /// The woken points where they show: a point of a body a Move dialog moves is where the move

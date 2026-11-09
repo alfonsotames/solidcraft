@@ -1017,6 +1017,59 @@ fn a_sketch_point_on_a_woken_middle_stays_the_sketch_point() {
     assert!(matches!(from.as_slice(), [Sel::SketchPoint { .. }]), "{from:?}");
 }
 
+/// On a body the Move dialog has already moved (30 mm along X by Translate, then Point to Point),
+/// the woken points show and are picked where the preview draws the body, not where the model
+/// has it; a click on one is kept where Point to Point starts from, as a pick of the body is.
+#[test]
+fn a_moved_bodys_woken_points_show_where_it_is_drawn() {
+    let mut h = holed_plate_picking_from();
+    let mut d = h.app.dialog.take().unwrap();
+    d.kind = kind(TRANSLATE, &h.app.session.doc);
+    d.inputs = inputs(TRANSLATE);
+    d.inputs[0].items = vec![Sel::Body { name: "Body1".into() }];
+    if let Kind::Move { x, .. } = &mut d.kind {
+        *x = "30 mm".into();
+    }
+    switch_type(&h.app, &mut d, POINT_TO_POINT);
+    h.app.dialog = Some(d);
+    let (model, drawn) = (Vec3::new(45.0, 20.0, 10.0), Vec3::new(75.0, 20.0, 10.0));
+    h.step(&json!({ "move": { "world": [79, 20, 10] } })).unwrap();
+    assert!(h.app.viewport.woken.points.iter().any(|p| p.at.dist(model) < 1e-6), "the moved rim wakes the centre: {:?}", h.app.viewport.woken);
+    let proj = crate::viewport::projection(&h.app, h.app.viewport.rect.unwrap());
+    let screen = |p: Vec3| proj.to_screen(p).unwrap();
+    let hits = crate::snap_wake::hits(&h.app, &proj, screen(drawn));
+    assert!(matches!(hits.first(), Some((_, crate::viewport::Hit::Vertex { point, .. }, _)) if point.dist(drawn) < 1e-6), "{hits:?}");
+    assert!(crate::snap_wake::hits(&h.app, &proj, screen(model)).is_empty(), "nothing where the model has the plate");
+    h.step(&json!({ "click": { "world": [75, 20, 10] } })).unwrap();
+    let from = &h.app.dialog.as_ref().unwrap().inputs[1].items;
+    assert!(matches!(from.as_slice(), [Sel::Vertex { body, point }] if body == "Body1" && point.dist(drawn) < 1e-6), "{from:?}");
+}
+/// A vertex of another body nearer the pointer than a woken point is the one hovered and picked,
+/// even within the few pixels where a woken point wins over the edge it lies on.
+#[test]
+fn another_bodys_vertex_nearer_than_a_woken_point_wins() {
+    let mut h = holed_plate_picking_from();
+    h.step(&json!({ "move": { "world": [49, 20, 10] } })).unwrap();
+    let centre = Vec3::new(45.0, 20.0, 10.0);
+    assert!(woken_has(&h, centre), "the rim wakes its centre: {:?}", h.app.viewport.woken);
+    // A small box in the hole, the corner of its top two pixels from the woken centre on screen.
+    let proj = crate::viewport::projection(&h.app, h.app.viewport.rect.unwrap());
+    let screen = |p: Vec3| proj.to_screen(p).unwrap();
+    let per_mm = f64::from(screen(centre + Vec3::X).distance(screen(centre)));
+    let corner = centre + Vec3::X * (2.0 / per_mm);
+    assert!(f64::from(screen(corner).distance(screen(centre))) < f64::from(crate::snap_wake::ON), "within a woken point's own reach");
+    h.app.run("solid.box", json!({"length": 1, "width": 1, "height": 1, "corner": [corner.x, corner.y, 9], "operation": "new"})).unwrap();
+    h.step(&json!({ "move": { "world": [corner.x, corner.y, corner.z] } })).unwrap();
+    assert!(
+        matches!(&h.app.viewport.hover, Some(crate::viewport::Hit::Vertex { body, point }) if body == "Body2" && point.dist(corner) < 1e-6),
+        "{:?}",
+        h.app.viewport.hover
+    );
+    h.step(&json!({ "click": { "world": [corner.x, corner.y, corner.z] } })).unwrap();
+    let from = &h.app.dialog.as_ref().unwrap().inputs[1].items;
+    assert!(matches!(from.as_slice(), [Sel::Vertex { body, point }] if body == "Body2" && point.dist(corner) < 1e-6), "{from:?}");
+}
+
 /// Snap points are on by default; with the preference off, hovering a rim wakes nothing and a
 /// click in the hole's middle picks nothing there, as before (#5912).
 #[test]
@@ -1043,4 +1096,9 @@ fn an_axis_input_wakes_no_points() {
     d.active = 1;
     h.step(&json!({ "move": { "world": [49, 20, 10] } })).unwrap();
     assert!(h.app.viewport.woken.points.is_empty(), "{:?}", h.app.viewport.woken);
+}
+
+/// Whether a point is among the woken ones.
+fn woken_has(h: &crate::scenario::Harness, p: Vec3) -> bool {
+    h.app.viewport.woken.points.iter().any(|w| w.at.dist(p) < 1e-6)
 }
