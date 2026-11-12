@@ -204,17 +204,22 @@ const ON_LINE: f64 = 1e-7;
 /// along it, to be a piece of that curve: ten times what the booleans here are asked to hold.
 const AS_DRAWN: f64 = 1e-6;
 
-/// How far apart (mm) the boolean may read the ends of two edges of one loop that meet at one
-/// corner of its result: it reads each edge to within the B-rep's own tolerance, which a long
-/// chain of booleans grows past what the next boolean takes as closed (ten times its own).
-const ONE_CORNER: f64 = 1e-4;
+/// How far (mm) from a corner of a boolean's result, as the boolean read it, the curves of its two
+/// edges may meet and still meet at that corner: ten times [`AS_DRAWN`], how far a piece of an
+/// input curve may end from the corners read for its edge.
+const ONE_CORNER: f64 = 1e-5;
+
+/// How near (mm) two curves must come to cross or touch: rounding at a sheet's sizes, a tenth of
+/// the least the booleans here are asked to hold.
+const MEET: f64 = 1e-10;
 
 /// `op` of `a` with `b` by the kernel's planar boolean, with each curved edge of the result that
 /// runs along a curve of `a` or `b` given back as that curve's own piece. The boolean reads its
 /// result again from a B-rep, and fits arcs to free-form spans that lie near a circle (a
 /// letter's flat curves) and splines to conics; here a Bézier stays a Bézier and a conic a
-/// conic, between the same corners, and the edges of each loop meet exactly (see
-/// [`close_up`]). An edge that follows no input curve is kept as read.
+/// conic. A corner beside such a piece is put where the curves of its two edges meet, which the
+/// boolean read only to within its tolerance (see [`closed_up`]). Every other corner, and every
+/// edge that follows no input curve, stays as read.
 ///
 /// Until the kernel reads a span that merely lies near a circle as the span it is (#6748): it is
 /// the kernel's reader that breaks the planar booleans' own contract, that the result's
@@ -243,74 +248,367 @@ fn as_drawn<'a>(inputs: impl Iterator<Item = &'a Region2>, out: Vec<Region2>) ->
             (*s, b.inflated(AS_DRAWN + 2e-4))
         })
         .collect();
-    let redraw = |l: Loop2| {
-        let mut segs: Vec<Seg2> = l.segs.into_iter().map(|s| piece_of(&curves, &s).unwrap_or(s)).collect();
-        close_up(&mut segs);
-        Loop2 { segs }
-    };
+    let redraw = |l: Loop2| Loop2 { segs: closed_up(l.segs.into_iter().map(|s| piece_of(&curves, &s).unwrap_or(Edge::Read(s))).collect()) };
     out.into_iter().map(|r| Region2 { outer: redraw(r.outer), holes: r.holes.into_iter().map(redraw).collect() }).collect()
 }
 
-/// A loop's edges made to meet exactly where they meet within [`ONE_CORNER`]: the edge ending at
-/// a corner moved onto the start of the next, or, where it is an arc (whose ends its angles
-/// place), the next edge's start moved onto its end. Two arcs both end where their circles meet
-/// at the corner (see [`circles_meet`]), each by its own angle: moving one arc's end along its
-/// circle onto the other's would leave the part of the step that lies across that circle. The
-/// boolean reads each edge's ends to within the B-rep's tolerance, and an arc it fits ends near
-/// its corner, not on it. Left so, a step of a hair stays between neighbours: a smooth run of
-/// curves can't be followed across it, and the next boolean refuses a loop whose steps outgrow
-/// its own tolerance.
-fn close_up(segs: &mut [Seg2]) {
-    let n = segs.len();
-    for i in 0..n {
-        let j = (i + 1) % n;
-        let (Some(&a), Some(&b)) = (segs.get(i), segs.get(j)) else { continue };
-        let (end, start) = (a.end(), b.start());
-        if end == start || end.dist(start) > ONE_CORNER {
-            continue;
+/// An edge of a planar boolean's result: as the boolean read it, or the piece of a curve of its
+/// inputs that it runs along ([`piece_of`]).
+#[derive(Clone, Copy, Debug)]
+enum Edge {
+    Read(Seg2),
+    /// The part of `of` from its parameter `t0` to `t1`, either way round, which the boolean read
+    /// as `read`.
+    Piece {
+        of: Seg2,
+        t0: f64,
+        t1: f64,
+        read: Seg2,
+    },
+}
+
+impl Edge {
+    /// The edge as the boolean read it.
+    fn read(&self) -> Seg2 {
+        match *self {
+            Edge::Read(s) | Edge::Piece { read: s, .. } => s,
         }
-        match (a, b) {
-            (Seg2::Arc { center: ca, radius: ra, start: sa, sweep: wa }, Seg2::Arc { center: cb, radius: rb, start: sb, sweep: wb }) => {
-                // Two pieces of one circle (or circles that don't meet there) meet where the
-                // first ends.
-                let x = circles_meet((ca, ra), (cb, rb), end.lerp(start, 0.5)).unwrap_or(end);
-                let (ea, sb1) = (near_angle((x - ca).angle(), sa + wa), near_angle((x - cb).angle(), sb));
-                if let Some(s) = segs.get_mut(i) {
-                    *s = Seg2::Arc { center: ca, radius: ra, start: sa, sweep: ea - sa };
-                }
-                if let Some(s) = segs.get_mut(j) {
-                    *s = Seg2::Arc { center: cb, radius: rb, start: sb1, sweep: sb + wb - sb1 };
-                }
+    }
+
+    /// The curve the edge lies on, which its ends may move along: the line through a line's ends,
+    /// an arc's circle, a piece's input curve. None for a free-form edge as read, whose curve isn't
+    /// known past its ends.
+    fn own(&self) -> Option<Own> {
+        match *self {
+            Edge::Read(Seg2::Line { a, b }) => Some(Own::Line(a, b)),
+            Edge::Read(Seg2::Arc { center, radius, .. }) | Edge::Piece { of: Seg2::Arc { center, radius, .. }, .. } => {
+                Some(Own::Circle(center, radius))
             }
-            (Seg2::Arc { .. }, _) => {
-                if let Some(x) = segs.get_mut(j) {
-                    *x = ending_at(b, end, b.end());
-                }
+            Edge::Read(_) => None,
+            Edge::Piece { of, .. } => Some(Own::Curve(of)),
+        }
+    }
+
+    /// Where the edge ends (`end`) or starts, as read, on its own curve ([`Own`]'s parameter).
+    fn param(&self, end: bool) -> f64 {
+        let pick = |s: f64, e: f64| if end { e } else { s };
+        match *self {
+            Edge::Read(Seg2::Arc { start, sweep, .. }) => pick(start, start + sweep),
+            Edge::Read(_) => pick(0.0, 1.0),
+            Edge::Piece { of: Seg2::Arc { start, sweep, .. }, t0, t1, .. } => start + sweep * pick(t0, t1),
+            Edge::Piece { t0, t1, .. } => pick(t0, t1),
+        }
+    }
+}
+
+/// The curve an edge lies on ([`Edge::own`]), parametrized as the edge is: a line from its start
+/// (0) to its end (1) and on past them, a circle by angle, an input curve by its own parameter.
+#[derive(Clone, Copy, Debug)]
+enum Own {
+    Line(Vec2, Vec2),
+    Circle(Vec2, f64),
+    Curve(Seg2),
+}
+
+impl Own {
+    fn at(&self, u: f64) -> Vec2 {
+        match *self {
+            Own::Line(a, b) => a.lerp(b, u),
+            Own::Circle(c, r) => c + Vec2::from_angle(u) * r,
+            Own::Curve(g) => g.point_at(u),
+        }
+    }
+
+    fn derivative(&self, u: f64) -> Vec2 {
+        match *self {
+            Own::Line(a, b) => b - a,
+            Own::Circle(_, r) => Vec2::from_angle(u).perp() * r,
+            Own::Curve(g) => g.derivative(u),
+        }
+    }
+
+    /// The parameter of the curve's point nearest `p`, from `u`: exact on a line and a circle,
+    /// by Newton's steps along a curve, which find the foot of a point near it.
+    fn foot(&self, p: Vec2, u: f64) -> f64 {
+        match *self {
+            Own::Line(a, b) => {
+                let d = b - a;
+                let t = (p - a).dot(d) / d.len2();
+                if t.is_finite() { t } else { u }
             }
-            _ => {
-                if let Some(x) = segs.get_mut(i) {
-                    *x = ending_at(a, a.start(), start);
+            Own::Circle(c, _) => near_angle((p - c).angle(), u),
+            Own::Curve(g) => {
+                let mut t = u;
+                for _ in 0..16 {
+                    let d = g.derivative(t);
+                    let step = (p - g.point_at(t)).dot(d) / d.len2();
+                    if !step.is_finite() {
+                        break;
+                    }
+                    t += step;
+                    if step.abs() <= 1e-15 {
+                        break;
+                    }
                 }
+                t
             }
         }
     }
 }
 
+/// A corner put where the curves of its two edges meet ([`meet`]): the parameter on its own curve
+/// where the edge before the corner ends, and where the edge after it starts.
+#[derive(Clone, Copy, Debug)]
+struct Corner {
+    end: f64,
+    start: f64,
+}
+
+/// A loop's edges as [`as_drawn`] gives them back. At each corner beside a piece of an input curve,
+/// both edges end where their curves meet near it ([`meet`]): a line stays on its line, an arc on
+/// its circle and a piece on its input curve, and the two end on one point (two arcs, whose
+/// angles place their ends, to rounding). The boolean reads each edge's ends only to within the
+/// B-rep's tolerance, and an arc it fits ends near its corner, not on it: a smooth run of curves
+/// can't be followed across the step that leaves, and the next boolean refuses a loop whose steps
+/// outgrow its own tolerance.
+///
+/// Every other corner stays where the boolean read it, steps and all: closing a loop the boolean
+/// gave back open is the kernel's to do. So does a piece's end where the curves don't meet, as
+/// [`ending_at`] puts it, except an arc's, which its angles place: an arc piece with such a corner
+/// is kept as read. So is a corner where the edges' meeting would turn an edge round or leave
+/// nothing of it.
+fn closed_up(mut edges: Vec<Edge>) -> Vec<Seg2> {
+    if !edges.iter().any(|e| matches!(e, Edge::Piece { .. })) {
+        return edges.iter().map(Edge::read).collect();
+    }
+    let n = edges.len();
+    let next = |k: usize| if k + 1 < n { k + 1 } else { 0 };
+    let prev = |k: usize| if k > 0 { k - 1 } else { n - 1 };
+    // Corner `k` is where edge `k` ends and the next starts; `kept[k]` keeps it as read.
+    let mut kept = vec![false; n];
+    let meets = |edges: &[Edge], kept: &[bool], k: usize| -> Option<Corner> {
+        let (a, b) = (edges.get(k)?, edges.get(next(k))?);
+        if kept.get(k).copied().unwrap_or(true) || !(matches!(a, Edge::Piece { .. }) || matches!(b, Edge::Piece { .. })) {
+            return None;
+        }
+        let (e, s) = (a.read().end(), b.read().start());
+        if e.dist(s) > ONE_CORNER {
+            return None;
+        }
+        meet(a, b, e.lerp(s, 0.5))
+    };
+    let mut corners: Vec<Option<Corner>> = (0..n).map(|k| meets(&edges, &kept, k)).collect();
+    // Each round that changes anything keeps an arc piece as read or keeps a met corner as read,
+    // and neither is undone: at most `2n` of them.
+    for _ in 0..=2 * n {
+        let mut changed = false;
+        for i in 0..n {
+            let Some(&edge) = edges.get(i) else { continue };
+            let (before, after) = (corners.get(prev(i)).copied().flatten(), corners.get(i).copied().flatten());
+            if let Edge::Piece { of: Seg2::Arc { .. }, read, .. } = edge
+                && (before.is_none() || after.is_none())
+            {
+                if let Some(e) = edges.get_mut(i) {
+                    *e = Edge::Read(read);
+                }
+                for k in [prev(i), i] {
+                    let c = meets(&edges, &kept, k);
+                    if let Some(slot) = corners.get_mut(k) {
+                        *slot = c;
+                    }
+                }
+                changed = true;
+            } else if !keeps_its_way(&edge, before.map(|c| c.start), after.map(|c| c.end)) {
+                for k in [prev(i), i] {
+                    if let Some(x) = kept.get_mut(k) {
+                        *x = true;
+                    }
+                    if let Some(x) = corners.get_mut(k) {
+                        *x = None;
+                    }
+                }
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let at = |k: usize| corners.get(k).copied().flatten();
+    let mut segs: Vec<Seg2> = edges.iter().enumerate().map(|(i, e)| shaped(e, at(prev(i)).map(|c| c.start), at(i).map(|c| c.end))).collect();
+    // Each met corner is one point: where an arc's angle puts its end, or else on a line, or else
+    // where an input curve ends (at its parameter 0 or 1), or else where the edge before it ends.
+    let rank = |s: &Seg2, e: Option<&Edge>, u: f64| match (s, e) {
+        (Seg2::Arc { .. }, _) => 3,
+        (_, Some(Edge::Read(Seg2::Line { .. }))) => 2,
+        (_, Some(Edge::Piece { .. })) if [0.0, 1.0].contains(&u) => 1,
+        _ => 0,
+    };
+    for k in 0..n {
+        let Some(c) = at(k) else { continue };
+        let j = next(k);
+        let (Some(&a), Some(&b)) = (segs.get(k), segs.get(j)) else { continue };
+        let x = if rank(&a, edges.get(k), c.end) >= rank(&b, edges.get(j), c.start) { a.end() } else { b.start() };
+        if let Some(s) = segs.get_mut(k)
+            && !matches!(s, Seg2::Arc { .. })
+        {
+            *s = ending_at(*s, s.start(), x);
+        }
+        if let Some(s) = segs.get_mut(j)
+            && !matches!(s, Seg2::Arc { .. })
+        {
+            *s = ending_at(*s, x, s.end());
+        }
+    }
+    segs
+}
+
+/// Where the curve of `a`, which ends at a corner, and that of `b`, which starts there, meet near
+/// `near`, the corner as the boolean read it, and within [`ONE_CORNER`] of it:
+/// - where they cross or touch, each within [`MEET`] of the point: two circles
+///   ([`circles_meet`]), a line and a circle ([`line_meets_circle`]), two pieces of one input
+///   curve anywhere along it, and any others where Newton's steps find one crossing ([`crossing`]);
+/// - or else where an input curve ends within [`AS_DRAWN`] of the other edge's curve: a corner of
+///   the inputs, where its two curves run on from each other (a smooth join has no one crossing).
+///   The piece's end moves onto the other edge's curve there, by no more than [`ending_at`] moves
+///   a piece's end onto a corner the boolean read.
+///
+/// None where they don't meet there, and beside a free-form edge as read.
+fn meet(a: &Edge, b: &Edge, near: Vec2) -> Option<Corner> {
+    let (ca, cb) = (a.own()?, b.own()?);
+    let (ua, ub) = (a.param(true), b.param(false));
+    let found = match (ca, cb) {
+        (Own::Line(..), Own::Line(..)) => None,
+        (Own::Circle(c0, r0), Own::Circle(c1, r1)) => circles_meet((c0, r0), (c1, r1), near).map(|x| (ca.foot(x, ua), cb.foot(x, ub))),
+        (Own::Line(p, q), Own::Circle(c, r)) | (Own::Circle(c, r), Own::Line(p, q)) => {
+            line_meets_circle((p, q), (c, r), near).map(|x| (ca.foot(x, ua), cb.foot(x, ub)))
+        }
+        // Two pieces of one curve, one after the other along it (not where it crosses itself).
+        (Own::Curve(g), Own::Curve(h)) if g == h && (ca.foot(near, ua) - cb.foot(near, ub)).abs() <= 1e-9 => {
+            let t = ca.foot(near, ua);
+            (ca.at(t).dist(near) <= AS_DRAWN).then_some((t, t))
+        }
+        _ => crossing(ca, ua, cb, ub, near),
+    };
+    found
+        .or_else(|| match ca {
+            Own::Curve(g) => ends_on(&g, ua, cb, ub, near),
+            _ => None,
+        })
+        .or_else(|| match cb {
+            Own::Curve(g) => ends_on(&g, ub, ca, ua, near).map(|(v, u)| (u, v)),
+            _ => None,
+        })
+        .map(|(end, start)| Corner { end, start })
+}
+
+/// Where curves `a` and `b` cross near their parameters `u` and `v`, as those parameters, by
+/// Newton's steps: None where they run together there (with no one crossing to find), and where
+/// the steps end more than [`MEET`] apart or farther than [`ONE_CORNER`] from `near`.
+fn crossing(a: Own, mut u: f64, b: Own, mut v: f64, near: Vec2) -> Option<(f64, f64)> {
+    for _ in 0..32 {
+        let f = a.at(u) - b.at(v);
+        let (da, db) = (a.derivative(u), b.derivative(v));
+        let turn = da.cross(db);
+        if !(turn.abs() > 1e-9 * da.len() * db.len()) {
+            return None;
+        }
+        let (du, dv) = (-f.cross(db) / turn, da.cross(f) / turn);
+        if !(du.is_finite() && dv.is_finite()) {
+            return None;
+        }
+        u += du;
+        v += dv;
+        if (da * du).len() + (db * dv).len() <= MEET * 1e-3 {
+            break;
+        }
+    }
+    let (p, q) = (a.at(u), b.at(v));
+    (p.dist(q) <= MEET && p.dist(near) <= ONE_CORNER).then_some((u, v))
+}
+
+/// Where input curve `g`, at its parameter `u` at a corner near `near`, ends there, within
+/// [`AS_DRAWN`] of curve `other`: the end's parameter on `g`, and that of the point of `other`
+/// nearest it, from `v`.
+fn ends_on(g: &Seg2, u: f64, other: Own, v: f64, near: Vec2) -> Option<(f64, f64)> {
+    let (t, end) = if u < 0.5 { (0.0, g.start()) } else { (1.0, g.end()) };
+    if end.dist(near) > ONE_CORNER {
+        return None;
+    }
+    let w = other.foot(end, v);
+    (other.at(w).dist(end) <= AS_DRAWN).then_some((t, w))
+}
+
+/// Edge `edge` with its start and end at its own curve's parameters `s` and `e` ([`Own`]), where
+/// its corners meet, and where None, as read: a piece then ends on the corner the boolean read
+/// ([`ending_at`]).
+fn shaped(edge: &Edge, s: Option<f64>, e: Option<f64>) -> Seg2 {
+    match *edge {
+        Edge::Read(Seg2::Line { a, b }) => Seg2::Line { a: s.map_or(a, |u| a.lerp(b, u)), b: e.map_or(b, |u| a.lerp(b, u)) },
+        Edge::Read(Seg2::Arc { center, radius, start, sweep }) => {
+            let (from, to) = (s.map_or(start, |u| near_angle(u, start)), e.map_or(start + sweep, |u| near_angle(u, start + sweep)));
+            Seg2::Arc { center, radius, start: from, sweep: to - from }
+        }
+        Edge::Read(seg) => seg,
+        Edge::Piece { of: Seg2::Arc { center, radius, start, sweep }, t0, t1, .. } => {
+            let (a0, a1) = (start + sweep * t0, start + sweep * t1);
+            let (from, to) = (s.map_or(a0, |u| near_angle(u, a0)), e.map_or(a1, |u| near_angle(u, a1)));
+            Seg2::Arc { center, radius, start: from, sweep: to - from }
+        }
+        Edge::Piece { of, t0, t1, read } => {
+            let piece = between(&of, s.map_or(t0, |u| u.clamp(0.0, 1.0)), e.map_or(t1, |u| u.clamp(0.0, 1.0)));
+            ending_at(piece, if s.is_some() { piece.start() } else { read.start() }, if e.is_some() { piece.end() } else { read.end() })
+        }
+    }
+}
+
+/// Whether `edge`, started and ended at its own curve's parameters `s` and `e` (as read where
+/// None), still runs the way it was read, and over more than nothing.
+fn keeps_its_way(edge: &Edge, s: Option<f64>, e: Option<f64>) -> bool {
+    let (s0, e0) = (edge.param(false), edge.param(true));
+    let arc = matches!(edge, Edge::Read(Seg2::Arc { .. }) | Edge::Piece { of: Seg2::Arc { .. }, .. });
+    // As `shaped` takes them: an arc's angles turned to its own, a piece's parameters on its curve.
+    let to = |u: Option<f64>, was: f64| match u {
+        Some(u) if arc => near_angle(u, was),
+        Some(u) if matches!(edge, Edge::Piece { .. }) => u.clamp(0.0, 1.0),
+        Some(u) => u,
+        None => was,
+    };
+    let (was, now) = (e0 - s0, to(e, e0) - to(s, s0));
+    was * now > 0.0 && now.abs() > 1e-12 && (!arc || now.abs() <= std::f64::consts::TAU + 1e-12)
+}
+
 /// Where the circle about `c0` of radius `r0` and the one about `c1` of radius `r1` meet nearest
-/// `near`: where they cross, or where they touch (for two read a hair apart, the point between
-/// them on the line through their centres). None where that is more than [`ONE_CORNER`] from
-/// `near`, and for circles about one centre.
+/// `near`: where they cross or touch, within [`MEET`] of both (for two that miss by less, the
+/// point between them on the line through their centres), and anywhere where they are one circle.
+/// None where that is more than [`ONE_CORNER`] from `near`.
 fn circles_meet((c0, r0): (Vec2, f64), (c1, r1): (Vec2, f64), near: Vec2) -> Option<Vec2> {
-    let u = (c1 - c0).normalized()?;
+    let on = |p: &Vec2| (p.dist(c0) - r0).abs() <= MEET && (p.dist(c1) - r1).abs() <= MEET && p.dist(near) <= ONE_CORNER;
+    let Some(u) = (c1 - c0).normalized() else {
+        // About one centre: one circle, or two that never meet.
+        let p = c0 + (near - c0).normalized()? * r0;
+        return on(&p).then_some(p);
+    };
     let l = (c1 - c0).len();
     // From `c0` along the line of centres to the chord through the crossings, and half the chord.
     let along = (r0 * r0 - r1 * r1 + l * l) / (2.0 * l);
     let half = (r0 * r0 - along * along).max(0.0).sqrt();
     let foot = c0 + u * along;
-    [foot + u.perp() * half, foot - u.perp() * half]
-        .into_iter()
-        .filter(|p| p.dist(near) <= ONE_CORNER)
-        .min_by(|p, q| p.dist(near).total_cmp(&q.dist(near)))
+    [foot + u.perp() * half, foot - u.perp() * half].into_iter().filter(on).min_by(|p, q| p.dist(near).total_cmp(&q.dist(near)))
+}
+
+/// Where the line through `p` and `q` meets the circle about `c` of radius `r` nearest `near`:
+/// where it crosses or touches it, within [`MEET`] (for one that misses by less, its point nearest
+/// the centre). None where that is more than [`ONE_CORNER`] from `near`.
+fn line_meets_circle((p, q): (Vec2, Vec2), (c, r): (Vec2, f64), near: Vec2) -> Option<Vec2> {
+    let d = (q - p).normalized()?;
+    let foot = p + d * (c - p).dot(d);
+    let off = foot.dist(c);
+    if off > r + MEET {
+        return None;
+    }
+    let half = (r * r - off * off).max(0.0).sqrt();
+    [foot + d * half, foot - d * half].into_iter().filter(|x| x.dist(near) <= ONE_CORNER).min_by(|x, y| x.dist(near).total_cmp(&y.dist(near)))
 }
 
 /// The angle `a`, turned by whole turns to lie within half a turn of `to`.
@@ -322,7 +620,7 @@ fn near_angle(a: f64, to: f64) -> f64 {
 /// The piece of one of `curves` that edge `s` runs along, from `s`'s start to its end: within
 /// [`AS_DRAWN`] of `s` at both ends and at three points between. None for an edge that closes on
 /// itself, and where no curve fits.
-fn piece_of(curves: &[(Seg2, Aabb2)], s: &Seg2) -> Option<Seg2> {
+fn piece_of(curves: &[(Seg2, Aabb2)], s: &Seg2) -> Option<Edge> {
     let (p, q) = (s.start(), s.end());
     if p.dist(q) <= AS_DRAWN {
         return None;
@@ -336,12 +634,17 @@ fn piece_of(curves: &[(Seg2, Aabb2)], s: &Seg2) -> Option<Seg2> {
         if g.point_at(t0).dist(p) > AS_DRAWN || g.point_at(t1).dist(q) > AS_DRAWN || (t1 - t0).abs() < 1e-12 {
             continue;
         }
-        let piece = if t0 < t1 { part(g, t0, t1) } else { part(g, t1, t0).reversed() };
+        let piece = between(g, t0, t1);
         if probes.iter().all(|x| piece.point_at(piece.closest_param(*x)).dist(*x) <= AS_DRAWN) {
-            return Some(ending_at(piece, p, q));
+            return Some(Edge::Piece { of: *g, t0, t1, read: *s });
         }
     }
     None
+}
+
+/// The part of `g` from its parameter `t0` to `t1`, either way round.
+fn between(g: &Seg2, t0: f64, t1: f64) -> Seg2 {
+    if t0 < t1 { part(g, t0, t1) } else { part(g, t1, t0).reversed() }
 }
 
 /// The part of `g` from parameter `t0` to `t1` (`t0` < `t1`), the same kind of curve.
@@ -808,31 +1111,90 @@ mod tests {
         }
     }
 
-    /// Two arcs that a loop's corner joins, each read a hair past or short of it, both end where
-    /// their circles meet there, each by its own angle, and keep their other ends.
+    /// Two arcs of input circles that a loop's corner joins, each read a hair past or short of it,
+    /// both end where their circles meet there, each by its own angle, and keep their other ends.
     #[test]
     fn two_arcs_at_a_corner_end_where_their_circles_meet() {
         use std::f64::consts::PI;
 
         use solidcore_record::{Seg2, Vec2};
+
+        use super::Edge;
         let arc = |x: f64, y: f64, radius: f64, start: f64, sweep: f64| Seg2::Arc { center: Vec2::new(x, y), radius, start, sweep };
-        let closed = |a: Seg2, b: Seg2, at: Vec2| {
-            assert!(a.end().dist(b.start()) > 1e-5, "{a:?} {b:?}");
-            let mut segs = vec![a, b, Seg2::Line { a: b.end(), b: a.start() }];
-            super::close_up(&mut segs);
+        // An arc the boolean read, as the piece of input arc `of` it runs along.
+        let piece = |of: Seg2, read: Seg2| Edge::Piece { of, t0: of.closest_param(read.start()), t1: of.closest_param(read.end()), read };
+        let closed = |(a, of_a): (Seg2, Seg2), (b, of_b): (Seg2, Seg2), at: Vec2| {
+            assert!(a.end().dist(b.start()) > 1e-6, "{a:?} {b:?}");
+            let segs = super::closed_up(vec![piece(of_a, a), piece(of_b, b), Edge::Read(Seg2::Line { a: b.end(), b: a.start() })]);
+            assert!(matches!(segs[..], [Seg2::Arc { .. }, Seg2::Arc { .. }, Seg2::Line { .. }]), "{segs:?}");
             assert!(segs[0].end().dist(at) < 1e-12 && segs[1].start().dist(at) < 1e-12, "{segs:?}");
             assert!(segs[0].start().dist(a.start()) < 1e-12 && segs[1].end().dist(b.end()) < 1e-12, "{segs:?}");
             assert!((0..3).all(|i| segs[i].end().dist(segs[(i + 1) % 3].start()) < 1e-12), "{segs:?}");
         };
         // Square across each other: up the circle about the origin to (0, 10), then on along the
         // one about (10, 10), which crosses it there.
-        closed(arc(0.0, 0.0, 10.0, 0.0, FRAC_PI_2 + 3e-6), arc(10.0, 10.0, 10.0, PI + 2e-6, -FRAC_PI_2 - 2e-6), Vec2::new(0.0, 10.0));
+        closed(
+            (arc(0.0, 0.0, 10.0, 0.0, FRAC_PI_2 + 2e-7), arc(0.0, 0.0, 10.0, -0.5, 3.0)),
+            (arc(10.0, 10.0, 10.0, PI + 1e-7, -FRAC_PI_2 - 1e-7), arc(10.0, 10.0, 10.0, PI + 0.5, -2.5)),
+            Vec2::new(0.0, 10.0),
+        );
         // Smoothly into each other: along the circle about the origin to (0, 10), then along the
         // one about (0, 20), which touches it there.
-        closed(arc(0.0, 0.0, 10.0, PI, -FRAC_PI_2 - 2e-6), arc(0.0, 20.0, 10.0, -FRAC_PI_2 - 3e-6, FRAC_PI_2 + 3e-6), Vec2::new(0.0, 10.0));
-        // Two pieces of one circle: the second starts where the first ends.
-        let first = arc(5.0, -3.0, 4.0, 0.0, 1.0 + 4e-6);
-        closed(first, arc(5.0, -3.0, 4.0, 1.0 - 3e-6, 1.0), first.end());
+        closed(
+            (arc(0.0, 0.0, 10.0, PI, -FRAC_PI_2 - 1e-7), arc(0.0, 0.0, 10.0, PI + 0.5, -2.5)),
+            (arc(0.0, 20.0, 10.0, -FRAC_PI_2 - 2e-7, FRAC_PI_2 + 2e-7), arc(0.0, 20.0, 10.0, -PI, 3.5)),
+            Vec2::new(0.0, 10.0),
+        );
+        // Two pieces of one circle: they meet on it nearest the corner as read.
+        let (first, second, circle) = (arc(5.0, -3.0, 4.0, 0.0, 1.0 + 4e-7), arc(5.0, -3.0, 4.0, 1.0 - 3e-7, 1.0), arc(5.0, -3.0, 4.0, -1.0, 4.0));
+        let near = first.end().lerp(second.start(), 0.5);
+        closed((first, circle), (second, circle), Vec2::new(5.0, -3.0) + (near - Vec2::new(5.0, -3.0)).normalized().unwrap_or(Vec2::X) * 4.0);
+    }
+
+    /// A corner beside a piece of an input curve is put where the curve meets its neighbour's
+    /// curve, so a line stays on its line; a corner between two edges as the boolean read them
+    /// stays as read, with its step.
+    #[test]
+    fn a_corner_beside_a_piece_keeps_its_line_and_the_kernels_corners_stay() {
+        use solidcore_record::{Seg2, Vec2};
+
+        use super::Edge;
+        let v = Vec2::new;
+        // A quarter round from (10, 0) to (0, 10), drawn as one cubic, read with each end a hair off
+        // its corner; the lines it meets read a hair past it, and short of each other.
+        let drawn = Seg2::Cubic { p0: v(10.0, 0.0), p1: v(10.0, 5.5), p2: v(5.5, 10.0), p3: v(0.0, 10.0) };
+        let read = Seg2::Cubic { p0: v(10.0, 4e-7), p1: v(10.0, 5.5), p2: v(5.5, 10.0), p3: v(-2e-7, 10.0) };
+        let (bottom, left) = (Seg2::Line { a: v(0.0, 0.0), b: v(10.0 + 3e-7, 0.0) }, Seg2::Line { a: v(0.0, 10.0), b: v(0.0, 1e-7) });
+        let segs = super::closed_up(vec![Edge::Read(bottom), Edge::Piece { of: drawn, t0: 0.0, t1: 1.0, read }, Edge::Read(left)]);
+        let [Seg2::Line { a: a0, b: b0 }, curve @ Seg2::Cubic { .. }, Seg2::Line { a: a2, b: b2 }] = segs[..] else { panic!("{segs:?}") };
+        // The bottom line ends on its own line where the curve starts.
+        assert!(a0 == v(0.0, 0.0) && b0.y == 0.0 && (b0.x - 10.0).abs() < 1e-12, "{segs:?}");
+        assert!(b0 == curve.start() && curve.end() == a2, "{segs:?}");
+        assert!((a2.x == 0.0) && (a2.y - 10.0).abs() < 1e-12, "{segs:?}");
+        assert!([0.0, 0.3, 0.7, 1.0].iter().all(|t| curve.point_at(*t).dist(drawn.point_at(*t)) < 1e-12), "{curve:?}");
+        // The kernel's own corner, where the left line ends short of the bottom one, is left open.
+        assert!(b2 == v(0.0, 1e-7) && a0 != b2, "{segs:?}");
+    }
+
+    /// An arc piece whose neighbour's line passes it by, more than rounding, has no corner to end
+    /// on: the boolean's arc is kept as read.
+    #[test]
+    fn an_arc_piece_its_neighbour_passes_by_is_kept_as_read() {
+        use std::f64::consts::PI;
+
+        use solidcore_record::{Seg2, Vec2};
+
+        use super::Edge;
+        let v = Vec2::new;
+        // A slot's round end, read on a circle a nanometre larger than the drawn one, between two
+        // straight sides; the lower side runs 1e-8 mm below the drawn circle.
+        let read = Seg2::Arc { center: v(0.0, 0.0), radius: 5.0 + 1e-9, start: -FRAC_PI_2, sweep: PI };
+        let drawn = Seg2::Arc { center: v(0.0, 0.0), radius: 5.0, start: -FRAC_PI_2 - 0.5, sweep: PI + 1.0 };
+        let (lower, upper) = (Seg2::Line { a: v(-10.0, -5.0 - 1e-8), b: v(0.0, -5.0 - 1e-8) }, Seg2::Line { a: read.end(), b: v(-10.0, 5.0) });
+        let piece = Edge::Piece { of: drawn, t0: drawn.closest_param(read.start()), t1: drawn.closest_param(read.end()), read };
+        let back = Seg2::Line { a: v(-10.0, 5.0), b: v(-10.0, -5.0 - 1e-8) };
+        let segs = super::closed_up(vec![Edge::Read(lower), piece, Edge::Read(upper), Edge::Read(back)]);
+        assert_eq!(segs, vec![lower, read, upper, back]);
     }
 
     #[test]
