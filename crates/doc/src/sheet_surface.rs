@@ -635,7 +635,10 @@ fn piece_of(curves: &[(Seg2, Aabb2)], s: &Seg2) -> Option<Edge> {
             continue;
         }
         let piece = between(g, t0, t1);
-        if probes.iter().all(|x| piece.point_at(piece.closest_param(*x)).dist(*x) <= AS_DRAWN) {
+        if piece.start().dist(p) <= AS_DRAWN
+            && piece.end().dist(q) <= AS_DRAWN
+            && probes.iter().all(|x| piece.point_at(piece.closest_param(*x)).dist(*x) <= AS_DRAWN)
+        {
             return Some(Edge::Piece { of: *g, t0, t1, read: *s });
         }
     }
@@ -647,11 +650,23 @@ fn between(g: &Seg2, t0: f64, t1: f64) -> Seg2 {
     if t0 < t1 { part(g, t0, t1) } else { part(g, t1, t0).reversed() }
 }
 
-/// The part of `g` from parameter `t0` to `t1` (`t0` < `t1`), the same kind of curve.
+/// The part of `g` from parameter `t0` to `t1` (`t0` < `t1`), the same kind of curve. A conic's
+/// halves are split with their end weights made 1, which moves the parameter along the half past
+/// `t0`: there `t1` lies at `v / (v + √w₀ (1 − v))`, where `v` is where it lay before the weights
+/// were made 1 and `w₀ = (1 − t0)² + 2 t0 (1 − t0) w + t0²` is the conic's weight at `t0`.
 fn part(g: &Seg2, t0: f64, t1: f64) -> Seg2 {
-    let right = if t0 > 1e-12 { g.split_at(t0).1 } else { *g };
-    let t = (t1 - t0) / (1.0 - t0).max(1e-300);
-    if t < 1.0 - 1e-12 { right.split_at(t).0 } else { right }
+    // `split_at` splits no nearer an end than 1e-9.
+    let t0 = if t0 < 1e-9 { 0.0 } else { t0.min(1.0 - 1e-9) };
+    let right = if t0 > 0.0 { g.split_at(t0).1 } else { *g };
+    let v = (t1 - t0) / (1.0 - t0);
+    let v = match *g {
+        Seg2::Conic { w, .. } if t0 > 0.0 => {
+            let w0 = (1.0 - t0) * (1.0 - t0) + 2.0 * t0 * (1.0 - t0) * w + t0 * t0;
+            v / (v + w0.max(0.0).sqrt() * (1.0 - v))
+        }
+        _ => v,
+    };
+    if v < 1.0 - 1e-12 { right.split_at(v).0 } else { right }
 }
 
 /// `piece` with its ends put exactly on `p` and `q`, where they lie within [`AS_DRAWN`] of them:
@@ -1195,6 +1210,51 @@ mod tests {
         let back = Seg2::Line { a: v(-10.0, 5.0), b: v(-10.0, -5.0 - 1e-8) };
         let segs = super::closed_up(vec![Edge::Read(lower), piece, Edge::Read(upper), Edge::Read(back)]);
         assert_eq!(segs, vec![lower, read, upper, back]);
+    }
+
+    /// A piece of a conic whose middle weight isn't 1 (a quarter of an ellipse), cut at two points
+    /// inside it, stays on the ellipse: splitting a conic moves the parameter along its second half.
+    #[test]
+    fn a_strip_across_an_ellipse_keeps_it_an_ellipse() {
+        use std::f64::consts::FRAC_1_SQRT_2;
+
+        use solidcore_record::{Loop2, Region2, Seg2, Vec2};
+        use solidcraft_kernel::BoolOp;
+        let v = Vec2::new;
+        // The 15 x 8 ellipse about the origin, in four quarters, and a strip from x = 5 to 10, which
+        // crosses its upper and its lower right quarter twice each.
+        let quarter = |a: Vec2, apex: Vec2, b: Vec2| Seg2::Conic { a, apex, b, w: FRAC_1_SQRT_2 };
+        let ellipse = Region2 {
+            outer: Loop2 {
+                segs: vec![
+                    quarter(v(15.0, 0.0), v(15.0, 8.0), v(0.0, 8.0)),
+                    quarter(v(0.0, 8.0), v(-15.0, 8.0), v(-15.0, 0.0)),
+                    quarter(v(-15.0, 0.0), v(-15.0, -8.0), v(0.0, -8.0)),
+                    quarter(v(0.0, -8.0), v(15.0, -8.0), v(15.0, 0.0)),
+                ],
+            },
+            holes: Vec::new(),
+        };
+        let strip = Region2 { outer: Loop2::polygon(&[v(5.0, -10.0), v(10.0, -10.0), v(10.0, 10.0), v(5.0, 10.0)]).ccw(), holes: Vec::new() };
+        let cut = match super::boolean_as_drawn(std::slice::from_ref(&ellipse), std::slice::from_ref(&strip), BoolOp::Intersect, 1e-7) {
+            Ok(c) => c,
+            Err(e) => panic!("{e}"),
+        };
+        let [one] = &cut[..] else { panic!("{cut:?}") };
+        let segs = &one.outer.segs;
+        let on_ellipse = |p: Vec2| (p.x * p.x / 225.0 + p.y * p.y / 64.0 - 1.0).abs() < 1e-9;
+        let conics: Vec<&Seg2> = segs.iter().filter(|s| matches!(s, Seg2::Conic { .. })).collect();
+        assert_eq!(conics.len(), 2, "{segs:?}");
+        for c in conics {
+            assert!([0.0, 0.25, 0.5, 0.75, 1.0].iter().all(|t| on_ellipse(c.point_at(*t))), "{c:?}");
+        }
+        // The strip's sides keep to x = 5 and x = 10, and every corner is one point.
+        for s in segs.iter().filter(|s| matches!(s, Seg2::Line { .. })) {
+            let (a, b) = (s.start(), s.end());
+            assert!([5.0, 10.0].iter().any(|x| (a.x - x).abs() < 1e-12 && (b.x - x).abs() < 1e-12), "{s:?}");
+        }
+        let n = segs.len();
+        assert!((0..n).all(|i| segs[i].end() == segs[(i + 1) % n].start()), "{segs:?}");
     }
 
     #[test]
