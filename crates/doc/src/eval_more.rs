@@ -1403,10 +1403,13 @@ pub(super) fn surface_prism_cut(
     Ok(handled)
 }
 
-/// Refuses a tapered extrude cut (or intersect) that changes a sheet made from surfaces it targets
-/// (#6748), as the flat model refuses it: its walls are not square to the sheet, so the sheet
-/// can't keep it (read back, only its floor would show). A sheet clear of every tool by their
-/// exact boxes is passed over by a cut: a cut beside the sheet changes nothing.
+/// Refuses a tapered extrude cut that stops inside the thickness of a flat panel of a sheet made
+/// from surfaces, where it changes the sheet (#6748), as the flat model refuses it: read back, the
+/// pocket would keep its floor's size with walls square to the sheet. A tapered cut through a
+/// panel, from face to face, the reader cuts as its shadow, square through as a shop cuts it, as
+/// it does a hole at a slant (`sheet_surface_cuts.rs`); a cut beside the sheet changes nothing. A
+/// tapered intersect is refused wherever it changes the sheet, through or not: nothing shows the
+/// reader takes one right.
 pub(super) fn surface_taper_refused(st: &ModelState, tools: &[Body], targets: &[String], op: Operation) -> Result<()> {
     let all = targets.len() == 1 && targets.first().is_some_and(|t| t == "*");
     let reach: Vec<Option<Aabb3>> = tools.iter().map(exact_box).collect();
@@ -1416,12 +1419,70 @@ pub(super) fn surface_taper_refused(st: &ModelState, tools: &[Body], targets: &[
         }
         let Some(mb) = st.body(&sk.body) else { continue };
         let target = exact_box(&mb.body);
-        if op == Operation::Cut && reach.iter().all(|tool| boxes_apart(tool, &target)) {
+        if op == Operation::Cut && (reach.iter().all(|tool| boxes_apart(tool, &target)) || !stops_inside(sk, tools)) {
             continue;
         }
-        super::sheet_boolean_unchanged(&mb.body, tools, op)?;
+        if sheet_boolean_changes(&mb.body, tools, op)? {
+            return Err(DocError::Invalid(
+                "this sheet machining cannot be preserved in its flat material: use a parallel, untapered extrude pocket/cut, or unfold \
+                 before intersecting; unsupported 3D sheet machining is refused to prevent material restoration"
+                    .into(),
+            ));
+        }
     }
     Ok(())
+}
+
+/// Whether `tools`, by `op`, change `body`, read by the exact boolean of each tool with it.
+fn sheet_boolean_changes(body: &Body, tools: &[Body], op: Operation) -> Result<bool> {
+    let united;
+    let tools: &[Body] = if op == Operation::Intersect {
+        united =
+            super::intersection_tool_union(tools.iter().cloned().map(Traced::unnamed).collect())?.into_iter().map(|t| t.body).collect::<Vec<_>>();
+        &united
+    } else {
+        tools
+    };
+    for tool in tools {
+        let test = if op == Operation::Cut { kernel::BoolOp::Intersect } else { kernel::BoolOp::Cut };
+        if kernel::boolean(body, tool, test)?.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether one of `tools` stops inside the thickness of a flat panel of `sk`: over the panel's
+/// material, its exact box in the panel's frame (z 0 to the thickness through the panel) ends
+/// between the panel's two faces. Unknown is yes.
+fn stops_inside(sk: &crate::SurfaceSheet, tools: &[Body]) -> bool {
+    let Some((panels, _)) = sk.pieces_in_space() else { return true };
+    let t = sk.thickness;
+    let tol = (t * 1e-6).max(1e-9);
+    let between = |z: f64| z > tol && z < t - tol;
+    panels.iter().any(|(_, frame, own)| {
+        let back = frame.inverse();
+        let to_panel = [
+            [back.x.x, back.x.y, back.x.z, 0.0],
+            [back.y.x, back.y.y, back.y.z, 0.0],
+            [back.z.x, back.z.y, back.z.z, 0.0],
+            [back.shift.x, back.shift.y, back.shift.z, 1.0],
+        ];
+        // The panel's material, by a box that holds each of its edges exactly.
+        let (lo, hi) = own
+            .outer
+            .segs
+            .iter()
+            .map(crate::sheet_surface_cuts::seg_box)
+            .fold((Vec2::new(f64::INFINITY, f64::INFINITY), Vec2::new(f64::NEG_INFINITY, f64::NEG_INFINITY)), |(l, h), (a, b)| {
+                (Vec2::new(l.x.min(a.x), l.y.min(a.y)), Vec2::new(h.x.max(b.x), h.y.max(b.y)))
+            });
+        tools.iter().any(|tool| {
+            let Ok(b) = kernel::transform_matrix(tool, to_panel).and_then(|b| b.exact_bounds()) else { return true };
+            let over = b.min.x < hi.x && b.max.x > lo.x && b.min.y < hi.y && b.max.y > lo.y && b.max.z > tol && b.min.z < t - tol;
+            over && (between(b.min.z) || between(b.max.z))
+        })
+    })
 }
 
 /// What the drills of hole feature `f` take from the sheets made from surfaces they reach, of the

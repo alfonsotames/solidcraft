@@ -253,6 +253,23 @@ fn pockets_survive_forming_away_from_bends_and_refuse_bend_overlap_atomically() 
     assert!((volume(&mut cross) - 14900.0).abs() < 1e-6);
 }
 
+/// A tapered cut through a sheet made from surfaces, from face to face, is cut as its shadow,
+/// square through as a shop cuts it: a 10 x 10 square at 5° out from the plate's lower face,
+/// through the 2.5 plate, is 10 + 2 · 2.5 tan 5° = 10 + 5 tan 5° wide at its upper face, so the
+/// plate keeps 15000 − 2.5 (10 + 5 tan 5°)² = 14727.649 mm³. One that stops inside the thickness
+/// is refused (`unsupported_sheet_machining_is_atomic_but_true_no_change_is_allowed`).
+#[test]
+fn a_tapered_cut_through_a_sheet_is_cut_as_its_shadow() {
+    let mut s = Session::default();
+    base(&mut s, 100.0, 60.0);
+    rectangle_tool(&mut s, "Through", [20.0, 20.0], [30.0, 30.0]);
+    run(&mut s, "solid.extrude", json!({"sketch": "Through", "distance": 3, "operation": "cut", "taper": "5 deg"}));
+    let wide = 10.0 + 5.0 * 5.0f64.to_radians().tan();
+    let want = 15000.0 - 2.5 * wide * wide;
+    let got = volume(&mut s);
+    assert!((got - want).abs() < 1e-3, "{got} mm³, not {want}");
+}
+
 #[test]
 fn unsupported_sheet_machining_is_atomic_but_true_no_change_is_allowed() {
     let mut s = Session::default();
@@ -3499,7 +3516,9 @@ fn fold_at_a_tab_root_names_the_real_cause() {
     let e = s.execute("sheet.fold", &json!({"points": [[40, 50, 0.8], [60, 50, 0.8]], "fixed": [50, 25, 0.8]})).unwrap_err().to_string();
     assert!(!e.contains("slanted or curved"), "all edges are straight: {e}");
     assert!(e.contains("bend zone") && e.contains("reaches a corner of the sheet's outline"), "name the bend zone reaching the outline: {e}");
-    assert!(e.contains("at (40.000, 50.000,") || e.contains("at (60.000, 50.000,"), "name a corner at the tab's root: {e}");
+    // Its two corners lie as far from the line's middle: the first along the line as drawn,
+    // from (40, 50), is named.
+    assert!(e.contains("at (40.000, 50.000,"), "name the tab's root corner first along the line: {e}");
     assert_eq!(s.doc.to_json(), before);
     for (y, position) in [(50, "start"), (51, "centerline")] {
         let mut ok = Session::default();
@@ -3515,6 +3534,41 @@ fn fold_at_a_tab_root_names_the_real_cause() {
 /// at the same place, it is smooth, and the fold goes ahead. The S is symmetric about the point
 /// where the arcs meet, so the zone's mean width is that point's x, 120 − 10√3, and the bend adds
 /// θ·T²·(½ − K) per mm of it.
+/// A fold drawn across one tab of two folds that tab and leaves the other whole, though a corner
+/// of the other's outline lies in the fold's zone: only the pieces that fold are read for
+/// corners. Tab A runs x 10 to 30, y 50 to 70; tab B steps in at y 60, from x 60 to 55; the fold
+/// runs along y 60 across tab A only. The blank holds (100 · 50 + 20 · 20 + 30 · 10 + 35 · 10) ·
+/// 0.8 = 4840 mm³, and folding the 20 mm tab adds 20 · (π/2) · 0.8² · (½ − 0.44) = 1.206 mm³, what
+/// its bend holds over its flat zone.
+#[test]
+fn a_fold_across_one_tab_leaves_a_corner_of_another_in_its_zone_alone() {
+    let mut s = Session::default();
+    outline_blank(
+        &mut s,
+        json!([
+            [0, 0],
+            [100, 0],
+            [100, 50],
+            [90, 50],
+            [90, 70],
+            [55, 70],
+            [55, 60],
+            [60, 60],
+            [60, 50],
+            [30, 50],
+            [30, 70],
+            [10, 70],
+            [10, 50],
+            [0, 50]
+        ]),
+    );
+    assert!((volume(&mut s) - 4840.0).abs() < 1e-6);
+    run(&mut s, "sheet.fold", json!({"points": [[10, 60, 0.8], [30, 60, 0.8]], "fixed": [50, 25, 0.8]}));
+    let want = 4840.0 + 20.0 * FRAC_PI_2 * 0.8 * 0.8 * (0.5 - 0.44);
+    let got = volume(&mut s);
+    assert!((got - want).abs() < 1e-3, "{got} mm³, not {want}");
+}
+
 #[test]
 fn a_corner_of_five_degrees_in_the_zone_is_refused_and_two_arcs_meeting_smoothly_there_fold() {
     let fold = json!({"points": [[0, 40, 0.8], [100, 40, 0.8]], "fixed": [50, 10, 0.8]});

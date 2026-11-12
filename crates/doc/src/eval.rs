@@ -7406,8 +7406,8 @@ fn eval_feature(
             let mut constructor = None;
             let mut to_body = None;
             let tools = feature_tools_with_constructor(doc, vals, f, st, &mut constructor, &mut to_body, warning)?;
-            // A tapered cut's walls are not square to a sheet made from surfaces: refused where it
-            // changes one.
+            // A tapered cut that stops inside the thickness of a sheet made from surfaces, or a
+            // tapered intersect: refused where it changes the sheet (see `surface_taper_refused`).
             if matches!(operation, Operation::Cut | Operation::Intersect)
                 && matches!(&f.kind, FeatureKind::Extrude { extent, .. } if extent.taper.is_some())
                 && !st.surface_sheets.is_empty()
