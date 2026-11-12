@@ -1071,10 +1071,11 @@ impl SurfaceSheet {
     /// hand. A mirror turns each panel's chart over (u → −u), so that its frame stays
     /// right-handed with the material where it was and the copy's flat is its source's mirrored
     /// across the flat's y axis (x → −x). Every outline, anchor, cut and record in the charts and
-    /// the flat is mirrored with it, each joint and bend line runs the other way, each
-    /// perforation field counts its grid from the other side, and its rims and faces are named as
-    /// its own layout names them. None for a transform that is no rigid motion or mirror, and for
-    /// a mirror of a sheet with a roll.
+    /// the flat is mirrored with it, each joint and bend line runs the other way, and each
+    /// perforation field counts its grid from the other side. What the turn keeps, the records in
+    /// the charts and what each face was made for (its parts), is as the copy's own build has it;
+    /// the model names the faces from them. None for a transform that is no rigid motion or
+    /// mirror, and for a mirror of a sheet with a roll.
     pub fn copied(&self, body: &str, m: &crate::Mat) -> Option<SurfaceSheet> {
         let axis = |i: usize| m.get(i).map(|c| Vec3::new(c[0], c[1], c[2]));
         let (x, y, z) = (axis(0)?, axis(1)?, axis(2)?);
@@ -1160,7 +1161,8 @@ impl SurfaceSheet {
         for l in &mut self.loose {
             l.region = r(&l.region);
         }
-        // The flat lies in the first panel's chart: it turns over with it.
+        // The flat lies in the sheet's flat frame, which `copied` turns with `place`: its regions
+        // turn over with it.
         self.regions = self.regions.iter().map(r).collect();
         for b in &mut self.bends {
             b.zone = r(&b.zone);
@@ -1203,6 +1205,35 @@ impl SurfaceSheet {
                 if let Some(d) = drawn {
                     *d = turned(d);
                 }
+            }
+        }
+        // What each face was made for, as the copy's own build has it: a bend's ends, and the rims
+        // across or past them, are read from the end at its anchors' origin, which the turn moved
+        // to the bend's other end, and its tabs rank along it from there. So does the rim a
+        // bend's panel was made on.
+        use crate::sheet_surface_convert::{PanelMade, RimEdge, SheetPart};
+        let turn = |part: &mut SheetPart| {
+            if let SheetPart::BendEnd { at_origin, .. } | SheetPart::Rim { edge: RimEdge::End { at_origin } | RimEdge::Past { at_origin }, .. } = part
+            {
+                *at_origin = !*at_origin;
+            }
+        };
+        let mut tabs: std::collections::HashMap<SheetPart, usize> = std::collections::HashMap::new();
+        for face in self.parts.iter().flatten() {
+            if let (SheetPart::Tab { .. }, Some(k)) = (&face.part, face.place) {
+                let n = tabs.entry(face.part.clone()).or_default();
+                *n = (*n).max(k);
+            }
+        }
+        for face in self.parts.iter_mut().flatten() {
+            if let (SheetPart::Tab { .. }, Some(k)) = (&face.part, face.place) {
+                face.place = tabs.get(&face.part).map(|n| n.saturating_add(1).saturating_sub(k));
+            }
+            turn(&mut face.part);
+        }
+        for (_, made) in &mut self.recipes {
+            if let PanelMade::Bend { on: Some(part), .. } = made {
+                turn(part);
             }
         }
     }

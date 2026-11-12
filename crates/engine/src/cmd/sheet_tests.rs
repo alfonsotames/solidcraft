@@ -7028,7 +7028,9 @@ fn a_mirrored_sheet_copy_is_the_opposite_hand_with_the_mirror_image_flat_pattern
 /// puts it, the material on its left. A flange picked on the copy's back edge stores the name the
 /// model gives that edge (the source's back edge's, as the copy's: `@` the mirror that made it),
 /// lands on the copy's edge, and finds the edge by that name again when the base grows and the
-/// edge moves off the pick.
+/// edge moves off the pick. The faces read from a bend's anchor origin, which the mirror moved
+/// to the bend's other end, keep their names through the copy's next build: the ends of the
+/// copy's front flange's bend and the flange's rims across them.
 #[test]
 fn a_flange_on_a_mirrored_sheet_copy_is_picked_by_its_rims_name_and_lands_on_the_copys_edge() {
     use solidcore_record::Vec3;
@@ -7043,9 +7045,26 @@ fn a_flange_on_a_mirrored_sheet_copy_is_picked_by_its_rims_name_and_lands_on_the
     run(&mut s, "sketch.finish", json!({}));
     run(&mut s, "sheet.flange", json!({"sketch": "Base"}));
     run(&mut s, "sheet.flange", json!({"edges": [[50, 0, 2.5]], "height": 20}));
+    let front = s.doc.features.last().map_or(0, |f| f.id);
     run(&mut s, "sheet.flange", json!({"edges": [[100, 30, 2.5]], "height": 15}));
     run(&mut s, "solid.mirror", json!({"bodies": ["Body1"], "plane": "YZ"}));
     let copy = "Body1 (2)";
+    // The copy's front flange's faces read from its bend's anchor origin: the bend's two ends
+    // (`bend.end0`, `bend.end1`) and the flange's rims across them (`end0`, `end1`), each named
+    // and where its centroid is.
+    let ends = |s: &mut Session| -> Vec<(String, Vec3)> {
+        let r = run(s, "model.faces", json!({"body": copy}));
+        let mut out = Vec::new();
+        for f in r["faces"].as_array().into_iter().flatten() {
+            let (Some(name), c) = (f["name"].as_str(), &f["centroid"]) else { continue };
+            if name.starts_with(&format!("F{front}:end")) || name.starts_with(&format!("F{front}:bend.end")) {
+                out.push((name.to_string(), Vec3::new(c[0].as_f64().unwrap(), c[1].as_f64().unwrap(), c[2].as_f64().unwrap())));
+            }
+        }
+        out
+    };
+    let before = ends(&mut s);
+    assert_eq!(before.len(), 4, "{before:?}");
 
     // The copy's rims where its own layout puts them: the same panel and edge in its chart, the
     // material on the edge's left.
@@ -7072,6 +7091,12 @@ fn a_flange_on_a_mirrored_sheet_copy_is_picked_by_its_rims_name_and_lands_on_the
     assert!(copy_name.len() == 1 && copy_name[0].starts_with(source_name[0].split('|').next().unwrap()), "{copy_name:?} for {source_name:?}");
     run(&mut s, "sheet.flange", json!({"edges": [[-50, 60, 2.5]], "height": 10, "body": copy}));
     assert_eq!(s.doc.features.last().map(|f| f.edge_names.clone()), Some(copy_name));
+    // The copy's next build names each of those faces as before.
+    let after = ends(&mut s);
+    for (name, at) in &before {
+        let now = after.iter().find(|(_, p)| p.dist(*at) < 1e-6);
+        assert!(now.is_some_and(|(n, _)| n == name), "{name} at {at:?} is now {now:?}");
+    }
     let inside = |s: &Session, name: &str, p: [f64; 3]| {
         s.model
             .state()
