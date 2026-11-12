@@ -661,10 +661,10 @@ fn onto_panels(sk: &SurfaceSheet, was: &Body, now: &Body, walls: Option<&[usize]
         let near = within(seen(&after.near, &after.near_floors).map_err(|e| e.to_string())?)?;
         let far = within(seen(&after.far, &after.far_floors).map_err(|e| e.to_string())?)?;
         // Square walls: each face sees material wherever the other does.
-        let apart = |a: &[Region2], b: &[Region2]| boolean_as_drawn(a, b, BoolOp::Cut, tol).map(|r| area(&r)).map_err(|e| e.to_string());
+        let apart = |a: &[Region2], b: &[Region2]| planar_regions_boolean(a, b, BoolOp::Cut, tol).map(|r| area(&r)).map_err(|e| e.to_string());
         let slack = tol * 10.0 * perimeter(&footprint).max(1.0);
         let off_outline = |a: &[Region2], b: &[Region2]| -> std::result::Result<f64, String> {
-            let gaps = boolean_as_drawn(a, b, BoolOp::Cut, tol).map_err(|e| e.to_string())?;
+            let gaps = planar_regions_boolean(a, b, BoolOp::Cut, tol).map_err(|e| e.to_string())?;
             let mut off = 0.0;
             for g in &gaps {
                 if ours(g)? && (strict || !touches(g, &footprint, tol * 100.0)) {
@@ -861,7 +861,7 @@ fn flat_gone(
     let footprint = seen(&[before.near, before.far].concat(), &[before.near_floors, before.far_floors].concat())?;
     let (near, far) = (seen(&after.near, &after.near_floors)?, seen(&after.far, &after.far_floors)?);
     // Square walls: each face sees material wherever the other does.
-    let apart = |a: &[Region2], b: &[Region2]| boolean_as_drawn(a, b, BoolOp::Cut, tol).map(|r| area(&r)).map_err(|e| e.to_string());
+    let apart = |a: &[Region2], b: &[Region2]| planar_regions_boolean(a, b, BoolOp::Cut, tol).map(|r| area(&r)).map_err(|e| e.to_string());
     let slack = tol * 10.0 * perimeter(&footprint).max(1.0);
     if !(same_regions(&near, &far, tol) || (apart(&near, &far)? <= slack && apart(&far, &near)? <= slack)) {
         return Ok(None);

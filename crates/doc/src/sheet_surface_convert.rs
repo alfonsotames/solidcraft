@@ -2003,7 +2003,7 @@ fn read_surfaces(
             };
             for h in &panel.region.holes {
                 let hole = Region2 { outer: h.ccw(), holes: Vec::new() };
-                let met = crate::sheet_surface::boolean_as_drawn(
+                let met = solidcraft_kernel::planar_regions_boolean(
                     std::slice::from_ref(&hole),
                     std::slice::from_ref(&band),
                     solidcraft_kernel::BoolOp::Intersect,

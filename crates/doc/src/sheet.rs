@@ -402,7 +402,7 @@ pub(crate) fn material_boolean(a: &[Region2], b: &[Region2], op: kernel::BoolOp,
     let edges = ae.saturating_add(be);
     work.charge(edges.saturating_mul(edges).saturating_add(edges.saturating_mul(ap.saturating_add(bp))).saturating_mul(8))?;
     let (a, b) = (welded_regions(a), welded_regions(b));
-    let regions = crate::sheet_surface::boolean_as_drawn(a.as_ref(), b.as_ref(), op, 1e-7)?;
+    let regions = kernel::planar_regions_boolean(a.as_ref(), b.as_ref(), op, 1e-7)?;
     region_complexity(&regions)?;
     Ok(regions)
 }
